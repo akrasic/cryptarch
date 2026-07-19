@@ -1,0 +1,10 @@
+target/
+.git/
+.env
+cryptarch.key
+.dev-key
+dev-bouncer/
+docs/
+shots/
+*.md
+!README.md

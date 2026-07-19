@@ -1,0 +1,127 @@
+# Cryptarch deployable stack — Postgres (metadata) + the app + PgBouncer edge.
+# For Komodo: deploy as a stack. Point CRYPTARCH_SEED_SERVER_* at the real
+# managed server(s) you want to provision onto (not necessarily this Postgres).
+#
+# Topology (doc-cryptarch-edge-spec + CRYPTARCH-41): two networks make the
+# "bouncer is the only door" principle structural. `db` is the consumer-facing
+# attachable network (bouncer + your app containers); `backend` is stack
+# plumbing (postgres + cryptarch + the bouncer's server side). Postgres lives
+# ONLY on backend — a tenant container on `db` has no route to it. The
+# bouncer is the ONLY published database listener; Cryptarch renders the
+# bouncer's config into the shared bouncer_conf volume.
+#
+# Set secrets via a .env file (see .env.example) — do NOT commit real values.
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: cryptarch
+    volumes:
+      - cryptarch_pgdata:/var/lib/postgresql/data
+    # Backend only — no route from the consumer network to raw Postgres.
+    networks: [backend]
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on: [db]
+    environment:
+      CRYPTARCH_METADATA_DSN: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/cryptarch
+      CRYPTARCH_BIND: 0.0.0.0:8080
+      CRYPTARCH_ADMIN: ${CRYPTARCH_ADMIN:-admin}
+      CRYPTARCH_ADMIN_PASSWORD: ${CRYPTARCH_ADMIN_PASSWORD}
+      CRYPTARCH_DEFAULT_QUOTA: ${CRYPTARCH_DEFAULT_QUOTA:-3}
+      CRYPTARCH_SEED_SERVER_DSN: ${CRYPTARCH_SEED_SERVER_DSN}
+      CRYPTARCH_SEED_SERVER_NAME: ${CRYPTARCH_SEED_SERVER_NAME:-default}
+      CRYPTARCH_SEED_SERVER_HOST: ${CRYPTARCH_SEED_SERVER_HOST}
+      CRYPTARCH_SEED_SERVER_PORT: ${CRYPTARCH_SEED_SERVER_PORT:-5432}
+      # Default "Allowed from" for new databases: the db network below, so a
+      # container dropped onto it can reach its database with zero CIDR
+      # knowledge. Must match the ipam subnet under `networks:`.
+      CRYPTARCH_SEED_SERVER_DEFAULT_CIDR: ${CRYPTARCH_SEED_SERVER_DEFAULT_CIDR:-172.18.0.0/16}
+      # The in-stack dial address: what a container ON the db network dials
+      # (the bouncer service name, container port — not the published port).
+      # Seeded as a "db network" listener so db pages offer that string.
+      CRYPTARCH_SEED_SERVER_STACK_LISTENER: ${CRYPTARCH_SEED_SERVER_STACK_LISTENER:-bouncer:6432}
+      # Health loop (CRYPTARCH-43): sweep interval + optional alerting.
+      # NOTIFY_URL: an ntfy topic (https://ntfy.sh/your-topic) or any webhook;
+      # NOTIFY_FORMAT: ntfy (default) | json. Unset URL = audit-log only.
+      CRYPTARCH_HEALTH_INTERVAL_SECS: ${CRYPTARCH_HEALTH_INTERVAL_SECS:-60}
+      CRYPTARCH_NOTIFY_URL: ${CRYPTARCH_NOTIFY_URL:-}
+      CRYPTARCH_NOTIFY_FORMAT: ${CRYPTARCH_NOTIFY_FORMAT:-ntfy}
+      # At-rest encryption key for stored admin DSNs. Generate once on the host:
+      #   (umask 077; openssl rand -hex 32 > cryptarch.key)
+      # and keep it out of any backup that also holds the metadata DB.
+      CRYPTARCH_KEY_FILE: /run/secrets/cryptarch_key
+    volumes:
+      - ${CRYPTARCH_KEY_FILE_HOST:-./cryptarch.key}:/run/secrets/cryptarch_key:ro
+      # Shared with the bouncer: CRYPTARCH-11/12 render pgbouncer_hba.conf
+      # here and RELOAD via the console. The app writes as root (no USER in
+      # Dockerfile); the bouncer reads as uid 70 — renderer must write 0644.
+      - bouncer_conf:/etc/pgbouncer
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    # Backend reaches the metadata db and the bouncer console; the web UI is
+    # published above, so the app needs no presence on the consumer network.
+    networks: [backend]
+    restart: unless-stopped
+
+  # Seeds bouncer_conf from the repo-shipped bouncer-seed/ on first deploy
+  # only (skips if pgbouncer.ini already exists), so the bouncer never
+  # starts against an empty volume. After first boot, Cryptarch owns the
+  # hba file; edit the ini via the volume, not bouncer-seed/.
+  bouncer-init:
+    image: busybox:1.36
+    volumes:
+      - bouncer_conf:/conf
+      - ./bouncer-seed:/seed:ro
+    command: sh -c "if [ ! -f /conf/pgbouncer.ini ]; then cp /seed/* /conf/ && chmod 644 /conf/* && echo seeded; else echo already-seeded; fi"
+    network_mode: none
+    restart: "no"
+
+  # The edge. Config lives in the shared bouncer_conf volume; Cryptarch
+  # (CRYPTARCH-11/12) writes pgbouncer_hba.conf there and RELOADs via the
+  # console.
+  bouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    entrypoint: ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
+    depends_on:
+      bouncer-init:
+        condition: service_completed_successfully
+    volumes:
+      - bouncer_conf:/etc/pgbouncer
+    ports:
+      # Publish on the private-network interface of the host, not 0.0.0.0,
+      # unless consumers really do come from everywhere.
+      - "${BOUNCER_BIND:-127.0.0.1}:${BOUNCER_PORT:-6432}:6432"
+    healthcheck:
+      # Protocol-level ping; no auth needed. Makes a config crash-loop
+      # visible in `docker compose ps` instead of silently restarting.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    # The bridge: client side on the consumer network, server side on backend.
+    networks: [cryptarch, backend]
+    restart: unless-stopped
+
+# The db network: stable name, attachable, pinned subnet — so app containers
+# can join it (`docker network connect db myapp`, or `external: true` in
+# their own compose) and the seeded default "Allowed from" above is truthful.
+# If 172.18.0.0/16 collides on your host, change the subnet AND the
+# CRYPTARCH_SEED_SERVER_DEFAULT_CIDR default together.
+networks:
+  cryptarch:
+    name: db
+    attachable: true
+    ipam:
+      config:
+        - subnet: ${DB_NETWORK_SUBNET:-172.18.0.0/16}
+  # Stack-internal; deliberately NOT attachable and not named for joining.
+  backend:
+
+volumes:
+  cryptarch_pgdata:
+  bouncer_conf:
