@@ -45,19 +45,7 @@ impl PostgresEngine {
     /// The admin DSN pointed at `db` instead of its maintenance database.
     /// `db` has passed the strict name allowlist, so raw substitution is safe.
     fn tenant_dsn(&self, db: &str) -> String {
-        let (base, query) = match self.admin_dsn.split_once('?') {
-            Some((b, q)) => (b, Some(q)),
-            None => (self.admin_dsn.as_str(), None),
-        };
-        let authority_start = base.find("://").map(|i| i + 3).unwrap_or(0);
-        let trimmed = match base[authority_start..].find('/') {
-            Some(rel) => &base[..authority_start + rel],
-            None => base,
-        };
-        match query {
-            Some(q) => format!("{trimmed}/{db}?{q}"),
-            None => format!("{trimmed}/{db}"),
-        }
+        swap_db_in_dsn(&self.admin_dsn, db)
     }
 
     async fn connect_tenant(&self, dsn: &str) -> anyhow::Result<PgPool> {
@@ -148,6 +136,33 @@ impl PostgresEngine {
     }
 }
 
+/// Rewrite a Postgres DSN to point at `db`, preserving userinfo, host, and any
+/// query string. The path is the first `/` *after* the `@` — a password that
+/// itself contains `/` (raw, unencoded) must not be mistaken for the path
+/// separator. `db` is name-allowlisted by the caller, so raw substitution is
+/// safe.
+fn swap_db_in_dsn(dsn: &str, db: &str) -> String {
+    let (base, query) = match dsn.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (dsn, None),
+    };
+    let authority_start = base.find("://").map(|i| i + 3).unwrap_or(0);
+    // Userinfo (which may carry a raw '/') ends at '@'; start the path search
+    // there when present, so only the real host/path '/' is found.
+    let path_search_from = base[authority_start..]
+        .find('@')
+        .map(|at| authority_start + at + 1)
+        .unwrap_or(authority_start);
+    let trimmed = match base[path_search_from..].find('/') {
+        Some(rel) => &base[..path_search_from + rel],
+        None => base,
+    };
+    match query {
+        Some(q) => format!("{trimmed}/{db}?{q}"),
+        None => format!("{trimmed}/{db}"),
+    }
+}
+
 #[async_trait]
 impl DbEngine for PostgresEngine {
     fn kind(&self) -> &'static str {
@@ -160,11 +175,15 @@ impl DbEngine for PostgresEngine {
         let qrole = Self::quote_ident(role);
         let qdb = Self::quote_ident(db);
 
-        // Password is bound as a literal inside a DDL string; escape single
-        // quotes. (Postgres has no bind params for CREATE ROLE.)
-        let esc_pw = password.replace('\'', "''");
+        // Send the SCRAM verifier, never the plaintext. A literal password in
+        // CREATE/ALTER ROLE lands in the managed server's statement logs (and
+        // sqlx's slow-query WARN logs); the verifier is the stored form, so the
+        // role still authenticates with the plaintext we hand back in the
+        // connection string. Same posture the auth role uses in edge.rs. The
+        // verifier is ASCII base64/`$`/`:` — no single quotes to escape.
+        let verifier = postgres_protocol::password::scram_sha_256(password.as_bytes());
 
-        sqlx::query(&format!("CREATE ROLE {qrole} LOGIN PASSWORD '{esc_pw}'"))
+        sqlx::query(&format!("CREATE ROLE {qrole} LOGIN PASSWORD '{verifier}'"))
             .execute(&self.pool)
             .await
             .context("creating login role")?;
@@ -260,8 +279,10 @@ impl DbEngine for PostgresEngine {
 
     async fn rotate_password(&self, name: &str, password: &str) -> anyhow::Result<ConnString> {
         let qrole = Self::quote_ident(name);
-        let esc_pw = password.replace('\'', "''");
-        sqlx::query(&format!("ALTER ROLE {qrole} PASSWORD '{esc_pw}'"))
+        // SCRAM verifier, not plaintext — see create_user_db. Keeps the rotated
+        // password out of the managed server's statement logs.
+        let verifier = postgres_protocol::password::scram_sha_256(password.as_bytes());
+        sqlx::query(&format!("ALTER ROLE {qrole} PASSWORD '{verifier}'"))
             .execute(&self.pool)
             .await
             .context("rotating role password")?;
@@ -344,4 +365,41 @@ impl DbEngine for PostgresEngine {
         Ok(())
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_ident_doubles_embedded_quotes() {
+        assert_eq!(PostgresEngine::quote_ident("alice_app"), "\"alice_app\"");
+        assert_eq!(PostgresEngine::quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn swap_db_preserves_authority_and_query() {
+        assert_eq!(
+            swap_db_in_dsn("postgres://admin:pw@10.0.0.5:5432/postgres", "alice_app"),
+            "postgres://admin:pw@10.0.0.5:5432/alice_app"
+        );
+        assert_eq!(
+            swap_db_in_dsn("postgres://admin:pw@10.0.0.5:5432/postgres?sslmode=require", "alice_app"),
+            "postgres://admin:pw@10.0.0.5:5432/alice_app?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn swap_db_handles_slash_in_password() {
+        // A raw '/' in the password must not be read as the path separator.
+        assert_eq!(
+            swap_db_in_dsn("postgres://admin:p/w@10.0.0.5:5432/postgres", "alice_app"),
+            "postgres://admin:p/w@10.0.0.5:5432/alice_app"
+        );
+        // No path in the source DSN: append one.
+        assert_eq!(
+            swap_db_in_dsn("postgres://admin:a/b@host:5432", "alice_app"),
+            "postgres://admin:a/b@host:5432/alice_app"
+        );
+    }
 }

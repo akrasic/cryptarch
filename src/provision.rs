@@ -32,7 +32,7 @@ pub enum ProvisionError {
     NoServer,
     #[error("database quota reached ({used}/{quota})")]
     QuotaReached { used: i64, quota: i32 },
-    #[error("a database named '{0}' already exists on that server")]
+    #[error("a database named '{0}' already exists")]
     NameTaken(String),
     #[error("internal error")]
     Internal,
@@ -291,9 +291,10 @@ pub struct DbLookup {
     pub status: String,
 }
 
-/// Find a database record by name. Name is unique per server; with the v0.1
-/// single seed server this is effectively a unique lookup. Returns the first
-/// match. Used by lifecycle ops that then authorise by owner or admin.
+/// Find a database record by name. Database names are globally unique
+/// (migration 0010), so this resolves to at most one row — the `LIMIT 1` is
+/// belt-and-suspenders against a constraint regression, not disambiguation.
+/// Used by lifecycle ops that then authorise by owner or admin.
 pub async fn find_db(db: &sqlx::PgPool, name: &str) -> Result<Option<DbLookup>, ProvisionError> {
     sqlx::query_as::<_, DbLookup>(
         "SELECT id, owner_id, server_id, status FROM databases WHERE name = $1 LIMIT 1",
@@ -307,6 +308,14 @@ pub async fn find_db(db: &sqlx::PgPool, name: &str) -> Result<Option<DbLookup>, 
 /// Suspend (`active=false`) or resume (`active=true`) a database's login on the
 /// target server, and reflect it in metadata. Data is left intact — suspend is
 /// reversible. Caller has already authorised (owner or admin).
+///
+/// Resume re-checks quota: a suspended database drops out of the active count,
+/// so `suspend one → provision another → resume the first` would otherwise slip
+/// a user past their cap. The check runs under the same `FOR UPDATE` lock
+/// provisioning uses, and the metadata flip is provisional inside the
+/// transaction until the engine confirms — so an engine failure rolls the
+/// status back rather than leaving a LOGIN role marked suspended (or vice
+/// versa).
 pub async fn set_db_active(
     db: &sqlx::PgPool,
     registry: &ServerRegistry,
@@ -316,25 +325,63 @@ pub async fn set_db_active(
     actor: &str,
 ) -> Result<(), ProvisionError> {
     let engine = registry.get(lookup.server_id).ok_or(ProvisionError::NoServer)?;
-    engine.set_login(name, active).await.map_err(|e| {
-        tracing::error!("set_login failed for '{name}': {e}");
-        ProvisionError::Internal
-    })?;
-    let status = if active { "active" } else { "suspended" };
-    sqlx::query("UPDATE databases SET status = $1 WHERE id = $2")
-        .bind(status)
-        .bind(lookup.id)
-        .execute(db)
+
+    if active {
+        // Idempotent: resuming an already-active db is a no-op. Without this,
+        // the quota re-check below counts the db against itself (used includes
+        // it) and a direct POST would return a confusing "quota reached".
+        if lookup.status == "active" {
+            return Ok(());
+        }
+        let mut tx = db.begin().await.map_err(|_| ProvisionError::Internal)?;
+        // NULL quota = unlimited; the FOR UPDATE lock serialises this against a
+        // concurrent provision/resume for the same owner.
+        let quota: Option<i32> =
+            sqlx::query_scalar("SELECT db_quota FROM users WHERE id = $1 FOR UPDATE")
+                .bind(lookup.owner_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| ProvisionError::Internal)?;
+        // The db is currently suspended, so it isn't in this count yet —
+        // resuming it makes `used + 1`, which must not exceed the cap.
+        let used: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM databases WHERE owner_id = $1 AND status = 'active'",
+        )
+        .bind(lookup.owner_id)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| ProvisionError::Internal)?;
-    audit(
-        db,
-        actor,
-        if active { "resume_db" } else { "suspend_db" },
-        Some(name),
-        Some("ok"),
-    )
-    .await;
+        if let Some(q) = quota {
+            if used >= q as i64 {
+                let _ = tx.rollback().await;
+                return Err(ProvisionError::QuotaReached { used, quota: q });
+            }
+        }
+        // Flip the status inside the tx, then confirm on the target server. The
+        // `?` on the engine call drops `tx` (rollback) if set_login fails.
+        sqlx::query("UPDATE databases SET status = 'active' WHERE id = $1")
+            .bind(lookup.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| ProvisionError::Internal)?;
+        engine.set_login(name, true).await.map_err(|e| {
+            tracing::error!("set_login failed for '{name}': {e}");
+            ProvisionError::Internal
+        })?;
+        tx.commit().await.map_err(|_| ProvisionError::Internal)?;
+        audit(db, actor, "resume_db", Some(name), Some("ok")).await;
+    } else {
+        engine.set_login(name, false).await.map_err(|e| {
+            tracing::error!("set_login failed for '{name}': {e}");
+            ProvisionError::Internal
+        })?;
+        sqlx::query("UPDATE databases SET status = 'suspended' WHERE id = $1")
+            .bind(lookup.id)
+            .execute(db)
+            .await
+            .map_err(|_| ProvisionError::Internal)?;
+        audit(db, actor, "suspend_db", Some(name), Some("ok")).await;
+    }
     Ok(())
 }
 

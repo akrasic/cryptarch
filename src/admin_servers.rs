@@ -534,7 +534,7 @@ async fn reconnect_engine(state: &AppState, id: Uuid) {
         match servers::connect_row(&state.crypto, &row, state.allow_superuser).await {
             Ok(engine) => {
                 state.servers.register(row.id, row.name.clone(), row.engine.clone(), engine);
-                recheck_still_active(&state, id).await;
+                recheck_still_active(state, id).await;
             }
             Err(e) => {
                 state.servers.unregister(id);

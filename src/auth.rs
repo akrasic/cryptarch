@@ -35,6 +35,14 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
     Ok(hash)
 }
 
+/// A fixed, valid Argon2 hash computed once with our own params. The login
+/// path verifies against this when the username is unknown or suspended, so a
+/// missing account costs the same Argon2 work as a real one — response latency
+/// can't be used to enumerate usernames. No real password produces it.
+pub static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    hash_password("cryptarch-login-timing-equalizer").expect("computing dummy login hash")
+});
+
 /// Verify a plaintext password against a stored Argon2 hash. Never panics;
 /// a malformed stored hash is treated as a non-match.
 pub fn verify_password(password: &str, stored_hash: &str) -> bool {

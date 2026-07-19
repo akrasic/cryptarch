@@ -1,0 +1,13 @@
+-- CRYPTARCH-51 (audit H1): a database is addressed portal-wide by its name
+-- alone — the URL is /db/:name, and owner-scoped lookups key off name. That is
+-- only sound if a name maps to exactly one database. The original
+-- UNIQUE (server_id, name) guaranteed that per server, but Cryptarch targets a
+-- single VM: the name IS the role and the connection-string username, so a
+-- global namespace is the honest model. Promote the constraint to global.
+--
+-- Single-server deploys already have no cross-server collisions, so this
+-- migration cannot fail on existing data; it just makes the invariant explicit
+-- and enforced (name-based routing becomes provably unambiguous rather than
+-- accidentally so). Revisit if true multi-server (remote managed instances)
+-- ever lands — that is the point to switch to id-based addressing.
+ALTER TABLE databases ADD CONSTRAINT databases_name_key UNIQUE (name);

@@ -1,7 +1,9 @@
 [package]
 name = "cryptarch"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+# Edition 2024 floor; matches CI/Dockerfile toolchain.
+rust-version = "1.85"
 description = "Self-service, multi-engine, multi-server database provisioning portal"
 
 [dependencies]

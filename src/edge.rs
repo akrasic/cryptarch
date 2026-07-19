@@ -195,15 +195,14 @@ pub async fn run_init(
     // auth role.
     // NOT usesuper: the bouncer only ever needs consumer credentials — a
     // compromised auth role must not be able to harvest superuser verifiers.
-    let shim = format!(
-        "CREATE OR REPLACE FUNCTION cryptarch.get_auth(uname TEXT) \
+    let shim = "CREATE OR REPLACE FUNCTION cryptarch.get_auth(uname TEXT) \
          RETURNS TABLE(usename TEXT, passwd TEXT) \
          LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS \
          'SELECT usename::text, passwd::text FROM pg_shadow \
           WHERE usename = uname AND NOT usesuper'"
-    );
+        .to_string();
     let grants = [
-        format!("REVOKE ALL ON FUNCTION cryptarch.get_auth(TEXT) FROM PUBLIC"),
+        "REVOKE ALL ON FUNCTION cryptarch.get_auth(TEXT) FROM PUBLIC".to_string(),
         format!("GRANT EXECUTE ON FUNCTION cryptarch.get_auth(TEXT) TO {AUTH_ROLE}"),
         format!("GRANT USAGE ON SCHEMA cryptarch TO {AUTH_ROLE}"),
     ];
@@ -404,8 +403,7 @@ fn ensure_include(dir: &std::path::Path) -> anyhow::Result<&'static str> {
     let last_section = ini
         .lines()
         .map(str::trim)
-        .filter(|l| l.starts_with('['))
-        .last();
+        .rfind(|l| l.starts_with('['));
     if last_section != Some("[pgbouncer]") {
         bail!(
             "pgbouncer.ini's last section is {} — the knobs %include must sit at the end \

@@ -432,6 +432,90 @@ async fn quota_race_two_fast_clicks_cannot_exceed_cap() {
     assert_eq!(wins, 1, "exactly one of the two clicks wins");
 }
 
+#[tokio::test]
+async fn resume_cannot_exceed_quota() {
+    let Some(app) = test_app().await else { return };
+    let bob = login(&app, "bob", "bobpw123").await; // quota 1
+
+    // Fill the cap, then suspend to free the active slot.
+    let (st, _, _) = send(&app.router, "POST", "/provision", Some(&bob),
+        Some(provision_form(app.server_id, "bob_first", "10.0.0.0/24"))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = send(&app.router, "POST", "/db/bob_first/suspend", Some(&bob),
+        Some(String::new())).await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+
+    // With the slot freed, provisioning a second one succeeds.
+    let (st, _, body) = send(&app.router, "POST", "/provision", Some(&bob),
+        Some(provision_form(app.server_id, "bob_second", "10.0.0.0/24"))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body.contains("Database ready"), "second provision fits after the suspend");
+
+    // Resuming the first would make 2 active at quota 1 — must be refused,
+    // and the db must stay suspended.
+    let (st, _, body) = send(&app.router, "POST", "/db/bob_first/resume", Some(&bob),
+        Some(String::new())).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(body.contains("quota reached"), "resume past the cap is refused (got: {body})");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM databases WHERE name = 'bob_first'")
+            .fetch_one(&app.db)
+            .await
+            .unwrap();
+    assert_eq!(status, "suspended", "a refused resume leaves the db suspended");
+
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM databases d JOIN users u ON u.id = d.owner_id \
+         WHERE u.username = 'bob' AND d.status = 'active'",
+    )
+    .fetch_one(&app.db)
+    .await
+    .unwrap();
+    assert_eq!(active, 1, "quota holds across suspend/provision/resume");
+}
+
+#[tokio::test]
+async fn db_name_is_unique_across_servers() {
+    let Some(app) = test_app().await else { return };
+    let alice = login(&app, "alice", "alicepw123").await; // quota 2
+
+    // Provision "shared_name" on the default server.
+    let (st, _, body) = send(&app.router, "POST", "/provision", Some(&alice),
+        Some(provision_form(app.server_id, "shared_name", "10.0.0.0/24"))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body.contains("Database ready"));
+
+    // Stand up a SECOND managed server with its own recording engine.
+    let crypto = Crypto::from_hex_key(&"ab".repeat(32)).unwrap();
+    let sealed = crypto.seal("postgres://unused").unwrap();
+    let server2: Uuid = sqlx::query_scalar(
+        "INSERT INTO managed_servers (name, engine, host, port, admin_dsn_enc) \
+         VALUES ('test-srv-2', 'postgres', 'test-host-2', 5432, $1) RETURNING id",
+    )
+    .bind(&sealed)
+    .fetch_one(&app.db)
+    .await
+    .unwrap();
+    let engine2 = TestEngine::new();
+    app.servers.register(server2, "test-srv-2".into(), "postgres".into(), engine2.clone());
+
+    // The same name on the second server is refused globally (migration 0010),
+    // and the refusal lands before any DDL — engine2 is never touched. Alice
+    // still has quota to spare, so this is a name clash, not a quota block.
+    let (st, _, body) = send(&app.router, "POST", "/provision", Some(&alice),
+        Some(provision_form(server2, "shared_name", "10.0.0.0/24"))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body.contains("already exists"), "same name on another server is refused (got: {body})");
+    assert!(engine2.calls().is_empty(), "engine2 untouched — the insert failed before DDL");
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM databases WHERE name = 'shared_name'")
+            .fetch_one(&app.db)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "only the first database keeps the name");
+}
+
 // ---- ownership & admin boundary ---------------------------------------------
 
 #[tokio::test]

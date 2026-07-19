@@ -150,7 +150,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Load a server's pool settings.
 pub async fn load_server_knobs(db: &sqlx::PgPool, server_id: Uuid) -> anyhow::Result<ServerKnobs> {
-    Ok(sqlx::query_as::<_, ServerKnobs>(
+    sqlx::query_as::<_, ServerKnobs>(
         "SELECT pool_mode, default_pool_size, max_client_conn, \
                 max_db_connections, max_user_connections \
          FROM managed_servers WHERE id = $1",
@@ -158,7 +158,7 @@ pub async fn load_server_knobs(db: &sqlx::PgPool, server_id: Uuid) -> anyhow::Re
     .bind(server_id)
     .fetch_optional(db)
     .await?
-    .ok_or_else(|| anyhow::anyhow!("no such server"))?)
+    .ok_or_else(|| anyhow::anyhow!("no such server"))
 }
 
 /// Load all per-database overrides for a server. Suspended databases keep

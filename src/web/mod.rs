@@ -30,6 +30,12 @@ pub struct LoginThrottle(
 
 const THROTTLE_MAX_FAILURES: u32 = 5;
 const THROTTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+/// Hard ceiling on tracked usernames. Failed logins carry an attacker-chosen
+/// username, so without a cap a spray of distinct names would grow the map
+/// without bound (memory DoS). At the ceiling we evict a NOT-currently-tripped
+/// entry (oldest first) — a spray of single-failure usernames must never knock
+/// a genuinely-throttled victim off the list and reset their guess budget.
+const THROTTLE_MAX_TRACKED: usize = 4096;
 
 impl LoginThrottle {
     pub fn is_throttled(&self, user: &str) -> bool {
@@ -50,9 +56,29 @@ impl LoginThrottle {
     /// Record one failure; returns the count now on record.
     pub fn record_failure(&self, user: &str) -> u32 {
         let mut map = self.0.lock().unwrap();
-        let entry = map.entry(user.to_string()).or_insert((0, std::time::Instant::now()));
-        if entry.1.elapsed() > THROTTLE_WINDOW {
-            *entry = (0, std::time::Instant::now());
+        let now = std::time::Instant::now();
+        // Drop fully-expired entries first — bounds the map to usernames that
+        // failed within the window, and is cheap at realistic sizes.
+        map.retain(|_, (_, since)| now.duration_since(*since) <= THROTTLE_WINDOW);
+        // Still at the ceiling with a new username? Evict to stay bounded —
+        // but prefer an entry that ISN'T currently throttled (oldest first), so
+        // a spray of single-failure usernames is what gets dropped, not a
+        // genuinely-tripped victim. Only if every slot is already tripped (a
+        // far larger, ~MAX×MAX_FAILURES attack) do we fall back to oldest overall.
+        if map.len() >= THROTTLE_MAX_TRACKED && !map.contains_key(user) {
+            let evict = map
+                .iter()
+                .filter(|(_, (n, _))| *n < THROTTLE_MAX_FAILURES)
+                .min_by_key(|(_, (_, since))| *since)
+                .or_else(|| map.iter().min_by_key(|(_, (_, since))| *since))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = evict {
+                map.remove(&k);
+            }
+        }
+        let entry = map.entry(user.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) > THROTTLE_WINDOW {
+            *entry = (0, now);
         }
         entry.0 += 1;
         entry.0
@@ -346,7 +372,7 @@ struct LoginInput {
 
 /// A row we need to authenticate a user. Role/identity aren't kept here —
 /// the session lookup reads them fresh from users on every request.
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Clone)]
 struct UserAuthRow {
     id: uuid::Uuid,
     username: String,
@@ -369,17 +395,33 @@ async fn login_submit(
         ))
         .into_response();
     }
-    let row = sqlx::query_as::<_, UserAuthRow>(
+    let row = match sqlx::query_as::<_, UserAuthRow>(
         "SELECT id, username, password_hash, is_active \
          FROM users WHERE username = $1",
     )
     .bind(username)
     .fetch_optional(&state.db)
-    .await;
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("login query failed: {e}");
+            return login_page(Some("Internal error.")).into_response();
+        }
+    };
 
-    let user = match row {
-        Ok(Some(u)) if u.is_active && auth::verify_password(&input.password, &u.password_hash) => u,
-        Ok(_) => {
+    // Always spend exactly one Argon2 verify — against the real hash for an
+    // existing active user, else a fixed dummy — so a missing or suspended
+    // account is indistinguishable from a wrong password by response latency.
+    let candidate = row.as_ref().filter(|u| u.is_active);
+    let hash = candidate
+        .map(|u| u.password_hash.as_str())
+        .unwrap_or_else(|| auth::DUMMY_HASH.as_str());
+    let password_ok = auth::verify_password(&input.password, hash);
+
+    let user = match candidate {
+        Some(u) if password_ok => u.clone(),
+        _ => {
             let n = state.login_throttle.record_failure(username);
             if n == THROTTLE_MAX_FAILURES {
                 // The trip itself is the audit-worthy event; per-attempt
@@ -388,10 +430,6 @@ async fn login_submit(
                     .await;
             }
             return login_page(Some("Invalid credentials.")).into_response();
-        }
-        Err(e) => {
-            tracing::error!("login query failed: {e}");
-            return login_page(Some("Internal error.")).into_response();
         }
     };
     state.login_throttle.clear(username);
@@ -446,13 +484,17 @@ async fn dashboard(
     .await
     .unwrap_or_default();
 
-    let quota: Option<i32> = sqlx::query_scalar("SELECT db_quota FROM users WHERE id = $1")
+    // A transient read error must not masquerade as quota 0 and false-block
+    // the "New database" button — the authoritative check runs transactionally
+    // in provision_db regardless. On error, show the count and don't gate.
+    let quota_read = sqlx::query_scalar::<_, Option<i32>>("SELECT db_quota FROM users WHERE id = $1")
         .bind(session.user_id)
         .fetch_one(&state.db)
-        .await
-        .unwrap_or(Some(0));
+        .await;
+    let quota_known = quota_read.is_ok();
+    let quota: Option<i32> = quota_read.unwrap_or(None);
     let used = dbs.iter().filter(|d| d.status == "active").count();
-    let at_cap = quota.is_some_and(|q| used >= q.max(0) as usize);
+    let at_cap = quota_known && quota.is_some_and(|q| used >= q.max(0) as usize);
 
     shell(
         "Your databases",
@@ -527,7 +569,49 @@ fn parse_allowed_from(raw: Option<&str>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{flash_msg, parse_allowed_from};
+    use super::{flash_msg, parse_allowed_from, LoginThrottle, THROTTLE_MAX_TRACKED};
+
+    #[test]
+    fn throttle_map_is_bounded_under_username_spray() {
+        let t = LoginThrottle::default();
+        // A spray of distinct attacker-chosen usernames must not grow the map
+        // past the ceiling.
+        for i in 0..(THROTTLE_MAX_TRACKED + 500) {
+            t.record_failure(&format!("sprayed_user_{i}"));
+        }
+        let len = t.0.lock().unwrap().len();
+        assert!(len <= THROTTLE_MAX_TRACKED, "throttle map stayed bounded (was {len})");
+    }
+
+    #[test]
+    fn throttle_trips_a_targeted_account_after_max_failures() {
+        let t = LoginThrottle::default();
+        assert!(!t.is_throttled("victim"));
+        for _ in 0..super::THROTTLE_MAX_FAILURES {
+            t.record_failure("victim");
+        }
+        assert!(t.is_throttled("victim"), "the targeted account trips at the cap");
+        t.clear("victim");
+        assert!(!t.is_throttled("victim"), "a successful login clears the trip");
+    }
+
+    #[test]
+    fn throttle_spray_cannot_evict_a_tripped_victim() {
+        let t = LoginThrottle::default();
+        // Trip the victim, then flood far past the cap with fresh usernames.
+        for _ in 0..super::THROTTLE_MAX_FAILURES {
+            t.record_failure("victim");
+        }
+        assert!(t.is_throttled("victim"));
+        for i in 0..(THROTTLE_MAX_TRACKED * 2) {
+            t.record_failure(&format!("sprayed_{i}"));
+        }
+        // The spray evicts its own single-failure entries, never the victim —
+        // otherwise the throttle would reset a real attacker's guess budget.
+        assert!(t.is_throttled("victim"), "a tripped account survives a username spray");
+        let len = t.0.lock().unwrap().len();
+        assert!(len <= THROTTLE_MAX_TRACKED, "still bounded (was {len})");
+    }
 
     #[test]
     fn allowed_from_parsing() {
@@ -1033,10 +1117,9 @@ async fn db_reset(
     .await
     {
         Ok(done) => {
-            // Owner-scoped lookup: find_db is name-only and names are unique
-            // per server, not globally — it could return another tenant's
-            // same-named row and leak their listener topology into our
-            // credential strings.
+            // Owner-scoped lookup: resolve the row through owned_db_detail
+            // (owner_id + name) so the listener topology in the credential
+            // strings can only ever be this caller's own database.
             let alt = match provision::owned_db_detail(&state.db, session.user_id, &name).await {
                 Ok(Some(d)) => listener_conn_strings(&state, d.server_id, &done).await,
                 _ => Vec::new(),
