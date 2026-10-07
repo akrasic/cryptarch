@@ -8,3 +8,7 @@ docs/
 shots/
 *.md
 !README.md
+# The frontend is built in its own stage; local output must never be embedded.
+frontend/node_modules/
+frontend/build/
+frontend/.svelte-kit/

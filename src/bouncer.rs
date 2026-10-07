@@ -161,9 +161,11 @@ pub async fn load_server_knobs(db: &sqlx::PgPool, server_id: Uuid) -> anyhow::Re
     .ok_or_else(|| anyhow::anyhow!("no such server"))
 }
 
-/// Load all per-database overrides for a server. Suspended databases keep
-/// their lines — the limit must survive a suspend/resume cycle, and the hba
-/// (not this file) is what makes a suspended db unreachable.
+/// Load all per-database overrides for a server. Deliberately unfiltered by
+/// status: a database's pool knobs are a property of the database, not of
+/// whatever state it is in this second, and the hba (not this file) is what
+/// decides reachability. A transient status must not silently discard an
+/// operator's tuning.
 pub async fn load_overrides(db: &sqlx::PgPool, server_id: Uuid) -> anyhow::Result<Vec<DbOverride>> {
     Ok(sqlx::query_as::<_, DbOverride>(
         "SELECT name AS db_name, pool_mode, max_connections \

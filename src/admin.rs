@@ -6,628 +6,371 @@
 //! management (the encrypted multi-server registry) is a later task; this slice
 //! covers users, databases, and audit.
 
-use axum::extract::{Path, State};
-use axum::response::{IntoResponse, Redirect, Response};
-use axum::Form;
-use maud::{html, Markup};
-use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::{AdminUser, Session};
-use crate::web::{shell, status_badge, AppState};
+use sqlx::AssertSqlSafe;
+
+use crate::auth::Session;
+use crate::web::AppState;
 
 // ---- queries ----------------------------------------------------------------
 
-#[derive(sqlx::FromRow)]
-struct AdminUserRow {
-    id: Uuid,
-    username: String,
-    is_admin: bool,
-    is_active: bool,
+/// A user as the admin pages see them.
+#[derive(sqlx::FromRow, serde::Serialize)]
+pub struct AdminUserRow {
+    pub id: Uuid,
+    pub username: String,
+    pub is_admin: bool,
+    pub is_active: bool,
     /// NULL = unlimited.
-    db_quota: Option<i32>,
-    used: i64,
+    #[serde(rename = "quota")]
+    pub db_quota: Option<i32>,
+    /// By the quota enforcer's own predicate (CRYPTARCH-111).
+    pub used: i64,
+    /// Their password is one an admin set (CRYPTARCH-146).
+    pub must_change_password: bool,
 }
 
-/// The quota dropdown, shared by the users table and the add-user form.
-/// `current`: Some(n) or None (unlimited) marks the selected option.
-/// `for_whom` labels the control for AT — in a table there are N of these.
-fn quota_select(current: Option<Option<i32>>, for_whom: &str) -> Markup {
-    let is = |v: Option<i32>| current == Some(v);
-    html! {
-        select name="quota" aria-label={ "Quota for " (for_whom) } {
-            option value="2" selected[is(Some(2))] { "2" }
-            option value="5" selected[is(Some(5)) || current.is_none()] { "5" }
-            option value="10" selected[is(Some(10))] { "10" }
-            option value="unlimited" selected[is(None)] { "unlimited" }
-            // Preserve a legacy/custom value so an admin opening the form
-            // doesn't silently reassign it to a preset.
-            @if let Some(Some(q)) = current {
-                @if ![2, 5, 10].contains(&q) {
-                    option value=(q) selected { (q) " (current)" }
-                }
-            }
-        }
-    }
-}
-
-/// Parse the dropdown value: "unlimited" → None, else a bounded integer.
-fn parse_quota(raw: &str) -> Result<Option<i32>, ()> {
-    if raw == "unlimited" {
-        return Ok(None);
-    }
-    match raw.trim().parse::<i32>() {
-        Ok(q) if (0..=999).contains(&q) => Ok(Some(q)),
-        _ => Err(()),
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct AdminDbRow {
-    name: String,
-    status: String,
-    owner: String,
-    server_name: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct AuditRow {
-    id: i64,
-    actor: String,
-    action: String,
-    target: Option<String>,
-    detail: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-}
-
-// ---- overview ---------------------------------------------------------------
-
-pub async fn overview(State(state): State<AppState>, AdminUser(session): AdminUser) -> Response {
-    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
-    let db_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM databases")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
-    let server_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM managed_servers")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
-
-    shell(
-        "Admin",
-        &session,
-        html! {
-            (admin_nav("overview"))
-            h1 { "Admin" }
-            div.cards {
-                a.card href="/admin/users" { span.n { (user_count) } span.l { "users" } }
-                a.card href="/admin/databases" { span.n { (db_count) } span.l { "databases" } }
-                a.card href="/admin/servers" { span.n { (server_count) } span.l { "servers" } }
-            }
-            p { a.link href="/dashboard" { "← Back to your dashboard" } }
-        },
-    )
-    .into_response()
-}
-
-// ---- users ------------------------------------------------------------------
-
-pub async fn users(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    axum::extract::Query(flash): axum::extract::Query<crate::web::FlashQuery>,
-) -> Response {
-    let rows = sqlx::query_as::<_, AdminUserRow>(
+/// The users query, both pages: `{where}` narrows it (to one id, say).
+fn users_sql(filter: &str) -> String {
+    format!(
+        // The QUOTA predicate, not the admin-totals one (CRYPTARCH-111): this
+        // reads "used / quota", so it counts exactly what provision_db counts
+        // against the cap — otherwise an admin sees 1/2 for a user whose next
+        // provision will be refused at 2/2.
         "SELECT u.id, u.username, u.is_admin, u.is_active, u.db_quota, \
-                COUNT(d.id) FILTER (WHERE d.status = 'active') AS used \
+                COUNT(d.id) FILTER (WHERE {}) AS used, \
+                u.password_set_by IS NOT NULL AS must_change_password \
          FROM users u LEFT JOIN databases d ON d.owner_id = u.id \
-         GROUP BY u.id ORDER BY u.username",
+         {filter} GROUP BY u.id ORDER BY u.username",
+        crate::status::DbStatus::quota_exclusion_sql()
     )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    shell(
-        "Users · Admin",
-        &session,
-        html! {
-            (admin_nav("users"))
-            h1 { "Users" }
-            (crate::web::flash_banner(flash.msg()))
-            div.table-scroll {
-                table.dbs {
-                    thead { tr {
-                        th { "User" } th { "Role" } th { "Databases" } th { "Status" } th { "" }
-                    } }
-                    tbody {
-                        @for u in &rows {
-                            tr {
-                                td {
-                                    a href={ "/admin/users/" (u.id) } { code { (u.username) } }
-                                    @if u.username == session.username { " " span.muted { "(you)" } }
-                                }
-                                td { @if u.is_admin { "admin" } @else { "user" } }
-                                td.tnum {
-                                    (u.used) " / "
-                                    @match u.db_quota { Some(q) => { (q) }, None => { "∞" } }
-                                }
-                                td { (status_badge(if u.is_active { "active" } else { "suspended" })) }
-                                td {
-                                    a.link href={ "/admin/users/" (u.id) }
-                                        aria-label={ "Manage user " (u.username) } { "manage" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            p { a.button href="/admin/users/new" { "+ Add user" } }
-        },
-    )
-    .into_response()
 }
 
-// ---- per-user manage page (CRYPTARCH-36) ------------------------------------
-
-#[derive(sqlx::FromRow)]
-struct UserDbRow {
-    name: String,
-    status: String,
-    server_name: String,
+pub async fn list_users(db: &sqlx::PgPool) -> Result<Vec<AdminUserRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminUserRow>(AssertSqlSafe(users_sql(""))).fetch_all(db).await
 }
 
-pub async fn user_detail(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    Path(id): Path<Uuid>,
-    axum::extract::Query(flash): axum::extract::Query<crate::web::FlashQuery>,
-) -> Response {
-    let user = sqlx::query_as::<_, AdminUserRow>(
-        "SELECT u.id, u.username, u.is_admin, u.is_active, u.db_quota, \
-                COUNT(d.id) FILTER (WHERE d.status = 'active') AS used \
-         FROM users u LEFT JOIN databases d ON d.owner_id = u.id \
-         WHERE u.id = $1 GROUP BY u.id",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
-    let Some(u) = user else {
-        return crate::web::error_page(&session, axum::http::StatusCode::NOT_FOUND,
-            "No such user", "That user doesn't exist (maybe deleted in another tab).");
-    };
-    let dbs = sqlx::query_as::<_, UserDbRow>(
+pub async fn find_user(db: &sqlx::PgPool, id: Uuid) -> Result<Option<AdminUserRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminUserRow>(AssertSqlSafe(users_sql("WHERE u.id = $1")))
+        .bind(id)
+        .fetch_optional(db)
+        .await
+}
+
+/// One user's databases, newest first.
+pub async fn user_databases(db: &sqlx::PgPool, id: Uuid) -> Result<Vec<UserDbRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserDbRow>(
         "SELECT d.name, d.status, s.name AS server_name \
          FROM databases d JOIN managed_servers s ON s.id = d.server_id \
          WHERE d.owner_id = $1 ORDER BY d.created_at DESC",
     )
     .bind(id)
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
-    .unwrap_or_default();
-    let is_self = u.id == session.user_id;
-
-    shell(
-        &format!("{} · Admin", u.username),
-        &session,
-        html! {
-            (admin_nav("users"))
-            p { a.link href="/admin/users" { "← Users" } }
-            h1 { code { (u.username) } @if is_self { " " span.muted { "· you" } } }
-            (crate::web::flash_banner(flash.msg()))
-            dl.creds {
-                dt { "Role" } dd { @if u.is_admin { "admin" } @else { "user" } }
-                dt { "Status" } dd { (status_badge(if u.is_active { "active" } else { "suspended" })) }
-                dt { "Databases" } dd {
-                    (u.used) " of "
-                    @match u.db_quota { Some(q) => { (q) }, None => { "unlimited" } }
-                    " in use"
-                }
-            }
-
-            h2 { "Quota" }
-            form method="post" action={ "/admin/users/" (u.id) "/quota" } .scard {
-                (crate::web::srow("Database quota",
-                    "How many databases this user may hold at once. Lowering it never \
-                     deletes anything — it only blocks new provisioning past the cap.",
-                    quota_select(Some(u.db_quota), &u.username)))
-                (crate::web::sfoot(Some("Takes effect on their next provision attempt."), "Save"))
-            }
-
-            h2 { "Access" }
-            @if is_self {
-                p.muted { "That's you. Your own password and sessions live in "
-                          a.link href="/profile" { "Profile" } " — the admin path is for others, \
-                          so you can't suspend yourself out of the building." }
-            } @else {
-                div.scard {
-                    (crate::web::srow(
-                        if u.is_active { "Suspend account" } else { "Enable account" },
-                        if u.is_active {
-                            "Blocks login and signs out every session immediately. Their \
-                             databases keep running — suspend those separately if needed."
-                        } else {
-                            "Restores login. Their databases are untouched by this."
-                        },
-                        html! {
-                            form method="post" action={ "/admin/users/" (u.id) "/active" } .inline
-                                hx-confirm=[u.is_active.then(|| format!(
-                                    "Suspend {}? Their sessions are signed out immediately.", u.username))] {
-                                input type="hidden" name="active" value=(!u.is_active);
-                                @if u.is_active { button.danger type="submit" { "Suspend" } }
-                                @else { button type="submit" { "Enable" } }
-                            }
-                        }))
-                    (crate::web::srow("Reset password",
-                        "Generates a new password, shown once. Every session they have \
-                         is signed out.",
-                        html! {
-                            form method="post" action={ "/admin/users/" (u.id) "/reset-password" } .inline
-                                hx-confirm={ "Reset " (u.username) "'s password? All their sessions are signed out." } {
-                                button type="submit" { "Reset password" }
-                            }
-                        }))
-                }
-            }
-
-            h2 { "Databases" }
-            @if dbs.is_empty() {
-                p.muted { "None provisioned." }
-            } @else {
-                div.table-scroll {
-                    table.dbs {
-                        thead { tr { th { "Database" } th { "Server" } th { "Status" } } }
-                        tbody {
-                            @for d in &dbs {
-                                tr {
-                                    td { a href={ "/db/" (d.name) } { code { (d.name) } } }
-                                    td { (d.server_name) }
-                                    td { (status_badge(&d.status)) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .into_response()
 }
 
-// ---- create user / reset password (CRYPTARCH-16) ------------------------------
-
-#[derive(Deserialize)]
-pub struct NewUserInput {
-    username: String,
-    /// Empty = generate one (shown once, same show-once contract as db creds).
-    password: Option<String>,
-    quota: String,
-    is_admin: Option<String>,
+/// The overview's three counts: users, databases (anything still on a disk,
+/// CRYPTARCH-111), servers.
+pub async fn overview_counts(db: &sqlx::PgPool) -> (i64, i64, i64) {
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(db).await.unwrap_or(0);
+    let dbs: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM databases WHERE {}",
+        crate::status::DbStatus::counts_in_admin_totals_sql()
+    )))
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    let servers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM managed_servers").fetch_one(db).await.unwrap_or(0);
+    (users, dbs, servers)
 }
 
-pub async fn new_user_form(State(_): State<AppState>, AdminUser(session): AdminUser) -> Markup {
-    new_user_page(&session, None)
+/// Why an admin's change to a user was refused. Nothing changed in any.
+#[derive(Debug)]
+pub enum AdminError {
+    NotFound,
+    /// Not on yourself through the admin path: a suspended admin cannot sign
+    /// back in to lift it, and your own password lives in the profile.
+    OwnAccount,
+    BadUsername,
+    BadQuota,
+    TooShort,
+    TooLong,
+    UsernameTaken,
+    /// The acting admin is no longer an active admin — suspended, say, by
+    /// another admin a moment ago (S6a audit P2: two admins could suspend
+    /// each other into an empty building).
+    NotAnActiveAdmin,
+    Internal,
 }
 
-fn new_user_page(session: &Session, error: Option<&str>) -> Markup {
-    shell(
-        "Add user · Admin",
-        session,
-        html! {
-            (admin_nav("users"))
-            p { a.link href="/admin/users" { "← Users" } }
-            h1 { "Add user" }
-            @if let Some(msg) = error { p.error role="alert" { (msg) } }
-            form method="post" action="/admin/users" .scard {
-                (crate::web::srow("Username",
-                    "Lowercase letter first; lowercase, digits, _ and -; 3-32 characters.",
-                    html! { input type="text" name="username" placeholder="alice" autocomplete="off" required; }))
-                (crate::web::srow("Password",
-                    "Leave empty to generate a strong one — shown once on the next screen.",
-                    html! { input type="text" name="password" autocomplete="off" placeholder="generated if empty"; }))
-                (crate::web::srow("Database quota",
-                    "How many databases this user may hold at once.",
-                    quota_select(None, "the new user")))
-                (crate::web::srow("Admin",
-                    "Admins manage users, quotas, and servers — grant sparingly.",
-                    html! {
-                        select name="is_admin" {
-                            option value="" selected { "no" }
-                            option value="1" { "yes" }
-                        }
-                    }))
-                div.sfoot {
-                    a.link href="/admin/users" { "Cancel" }
-                    button.primary type="submit" { "Create user" }
-                }
+impl std::fmt::Display for AdminError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AdminError::NotFound => "That user doesn't exist — they may have been removed since this page loaded.",
+            AdminError::OwnAccount => {
+                "Not on your own account. Change your password in Profile; and a suspended admin \
+                 cannot sign back in to lift it — ask another admin."
             }
-        },
-    )
-}
-
-pub async fn create_user(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    Form(input): Form<NewUserInput>,
-) -> Response {
-    let username = input.username.trim();
-    if !crate::auth::valid_username(username) {
-        return new_user_page(&session,
-            Some("Username: lowercase letter first; lowercase, digits, _ and -; 3-32 chars."))
-            .into_response();
+            AdminError::BadUsername => "Username: lowercase letter first; lowercase, digits, _ and -; 3-32 chars.",
+            AdminError::BadQuota => "Quota must be 0-999 or unlimited.",
+            AdminError::TooShort => "Password must be at least 8 characters.",
+            AdminError::TooLong => "Password is too long.",
+            AdminError::UsernameTaken => "A user by that name already exists.",
+            AdminError::NotAnActiveAdmin => "Your account is no longer an active admin — nothing was changed.",
+            AdminError::Internal => "Cryptarch could not write the change, so nothing was altered.",
+        })
     }
-    let Ok(quota) = parse_quota(&input.quota) else {
-        return new_user_page(&session, Some("Quota must be 0-999 or unlimited.")).into_response();
-    };
-    let supplied = input.password.as_deref().map(str::trim).filter(|p| !p.is_empty());
-    if let Some(p) = supplied {
-        if p.len() < 8 {
-            return new_user_page(&session, Some("Password must be at least 8 characters.")).into_response();
-        }
+}
+
+fn internal(what: &str) -> impl FnOnce(sqlx::Error) -> AdminError + '_ {
+    move |e| {
+        tracing::error!("{what}: {e}");
+        AdminError::Internal
+    }
+}
+
+/// Lock the acting admin's row and the target's, in id order (so two admins
+/// acting on each other cannot deadlock), and require the actor to still be
+/// an active admin. Under these locks, two admins suspending each other
+/// serialise: the second finds itself suspended and is refused.
+async fn lock_actor_and_target(
+    tx: &mut sqlx::PgConnection,
+    actor: Uuid,
+    target: Uuid,
+) -> Result<(), AdminError> {
+    let rows: Vec<(Uuid, bool, bool)> = sqlx::query_as(
+        "SELECT id, is_active, is_admin FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+    )
+    .bind(vec![actor, target])
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(internal("locking the users an admin change touches"))?;
+    match rows.iter().find(|(id, ..)| *id == actor) {
+        Some((_, true, true)) => {}
+        _ => return Err(AdminError::NotAnActiveAdmin),
+    }
+    if !rows.iter().any(|(id, ..)| *id == target) {
+        return Err(AdminError::NotFound);
+    }
+    Ok(())
+}
+
+/// A quota in range, or None for unlimited.
+pub fn check_quota(q: Option<i64>) -> Result<Option<i32>, AdminError> {
+    match q {
+        None => Ok(None),
+        Some(n) if (0..=999).contains(&n) => Ok(Some(n as i32)),
+        Some(_) => Err(AdminError::BadQuota),
+    }
+}
+
+/// Create a user; returns the password to show ONCE (generated when none is
+/// given). The admin chose or saw it, so it is theirs until the user replaces
+/// it (CRYPTARCH-146).
+pub async fn create_user_for(
+    state: &AppState,
+    session: &Session,
+    username: &str,
+    password: Option<&str>,
+    quota: Option<i32>,
+    is_admin: bool,
+) -> Result<String, AdminError> {
+    let username = username.trim();
+    if !crate::auth::valid_username(username) {
+        return Err(AdminError::BadUsername);
+    }
+    let supplied = password.map(str::trim).filter(|p| !p.is_empty());
+    if supplied.is_some_and(|p| p.len() < 8) {
+        return Err(AdminError::TooShort);
+    }
+    if supplied.is_some_and(|p| p.len() > crate::auth::MAX_PASSWORD_LEN) {
+        return Err(AdminError::TooLong);
     }
     let password = supplied.map(String::from).unwrap_or_else(crate::names::generate_password);
-    let hash = match crate::auth::hash_password(&password) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!("hashing password for new user: {e}");
-            return new_user_page(&session, Some("Internal error.")).into_response();
-        }
-    };
-    let is_admin = input.is_admin.as_deref() == Some("1");
+    let hash = crate::auth::hash_password_capped(password.clone()).await.map_err(|e| {
+        tracing::error!("hashing password for new user: {e}");
+        AdminError::Internal
+    })?;
+    let mut tx = state.db.begin().await.map_err(internal("creating a user"))?;
     let res = sqlx::query(
-        "INSERT INTO users (username, password_hash, is_admin, db_quota) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO users (username, password_hash, is_admin, db_quota, password_set_by) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(username)
     .bind(&hash)
     .bind(is_admin)
     .bind(quota)
-    .execute(&state.db)
+    // The whole lineage: an admin acting on a password someone else set
+    // passes that on (CRYPTARCH-146).
+    .bind(session.actor())
+    .execute(&mut *tx)
     .await;
     if let Err(e) = res {
-        let msg = if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
-            format!("User '{username}' already exists.")
-        } else {
-            tracing::error!("creating user {username}: {e:#}");
-            "Saving failed.".into()
-        };
-        return new_user_page(&session, Some(&msg)).into_response();
-    }
-    crate::provision::audit(&state.db, &session.username, "create_user", Some(username),
-                            Some(&format!("admin={is_admin} quota={}",
-                                          quota.map_or("unlimited".into(), |q: i32| q.to_string()))))
-        .await;
-    crate::web::no_store(shell(
-        "User created · Admin",
-        &session,
-        html! {
-            (admin_nav("users"))
-            h1 { "User created" }
-            p { strong { "Save this now" } " — the password is shown once and stored only as a hash." }
-            dl.creds {
-                dt { "Username" } dd { code { (username) }
-                    button.copy type="button" data-copy=(username) aria-label="Copy username" { "copy" } }
-                dt { "Password" } dd { code { (password) }
-                    button.copy type="button" data-copy=(password) aria-label="Copy password" { "copy" } }
-                dt { "Role" } dd { @if is_admin { "admin" } @else { "user" } }
-            }
-            p { a.button href="/admin/users" { "Back to users" } }
-        },
-    ))
-}
-
-pub async fn reset_user_password(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    Path(id): Path<Uuid>,
-) -> Response {
-    // Same self-guard as set_active: resetting your own password via this
-    // admin path would kill your own session mid-flight. Use /profile.
-    if id == session.user_id {
-        return Redirect::to("/admin/users").into_response();
-    }
-    let target: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
-    let Some(target) = target else {
-        return crate::web::error_page(&session, axum::http::StatusCode::NOT_FOUND,
-            "No such user", "That user doesn't exist (maybe deleted in another tab).");
-    };
-    let password = crate::names::generate_password();
-    let hash = match crate::auth::hash_password(&password) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!("hashing reset password: {e}");
-            return crate::web::error_page(&session, axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Something went wrong", "Generating the new password failed — nothing was changed.");
+        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+            return Err(AdminError::UsernameTaken);
         }
-    };
-    if let Err(e) = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-        .bind(&hash)
-        .bind(id)
-        .execute(&state.db)
-        .await
-    {
-        tracing::error!("resetting password for {target}: {e}");
-        return crate::web::error_page(&session, axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Something went wrong", "Saving the new password failed — the old one still works.");
+        tracing::error!("creating user {username}: {e:#}");
+        return Err(AdminError::Internal);
     }
-    // Every session of that user dies — a reset is a revocation.
-    state.sessions.remove_all_for_user(id).await;
-    crate::provision::audit(&state.db, &session.username, "reset_user_password", Some(&target),
-                            Some("all sessions revoked"))
-        .await;
-    crate::web::no_store(shell(
-        "Password reset · Admin",
-        &session,
-        html! {
-            (admin_nav("users"))
-            h1 { "Password reset" }
-            p { "New password for " code { (target) } " — " strong { "shown once" }
-                ". All their sessions were signed out." }
-            dl.creds {
-                dt { "Username" } dd { code { (target) } }
-                dt { "Password" } dd { code { (password) }
-                    button.copy type="button" data-copy=(password) aria-label="Copy password" { "copy" } }
-            }
-            p { a.button href={ "/admin/users/" (id) } { "Back to " (target) } }
-        },
-    ))
+    // In the same transaction: the change and its record, together or not.
+    crate::provision::audit_in(&mut tx, &session.actor(), "create_user", Some(username),
+        Some(&format!("admin={is_admin} quota={}", quota.map_or("unlimited".into(), |q| q.to_string()))))
+        .await
+        .map_err(internal("auditing a new user"))?;
+    tx.commit().await.map_err(internal("creating a user"))?;
+    Ok(password)
 }
 
-#[derive(Deserialize)]
-pub struct QuotaInput {
-    quota: String,
+/// Reset another user's password: a new one (returned to show ONCE), every
+/// session of theirs gone, the account gated (CRYPTARCH-146) — in one
+/// transaction. A reset is a revocation; if the sessions cannot go, nothing
+/// happens and there is no password to show (CRYPTARCH-102 used to hand one
+/// over with live sessions behind it).
+pub async fn reset_user_password_for(
+    state: &AppState,
+    session: &Session,
+    id: Uuid,
+) -> Result<(String, String), AdminError> {
+    if id == session.user_id {
+        return Err(AdminError::OwnAccount);
+    }
+    let password = crate::names::generate_password();
+    let hash = crate::auth::hash_password_capped(password.clone()).await.map_err(|e| {
+        tracing::error!("hashing reset password: {e}");
+        AdminError::Internal
+    })?;
+    let mut tx = state.db.begin().await.map_err(internal("resetting a password"))?;
+    lock_actor_and_target(&mut tx, session.user_id, id).await?;
+    let target: String = sqlx::query_scalar(
+        "UPDATE users SET password_hash = $1, password_set_by = $3 WHERE id = $2 RETURNING username",
+    )
+    .bind(&hash)
+    .bind(id)
+    .bind(session.actor())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal("resetting a password"))?
+    .ok_or(AdminError::NotFound)?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal("signing out a reset user"))?;
+    crate::provision::audit_in(&mut tx, &session.actor(), "reset_user_password", Some(&target),
+        Some("all sessions revoked"))
+        .await
+        .map_err(internal("auditing a reset"))?;
+    tx.commit().await.map_err(internal("resetting a password"))?;
+    Ok((target, password))
 }
 
-pub async fn set_quota(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    Path(id): Path<Uuid>,
-    Form(input): Form<QuotaInput>,
-) -> Response {
-    let Ok(quota) = parse_quota(&input.quota) else {
-        // Only reachable by bypassing the dropdown — a terse styled page is enough.
-        return crate::web::error_page(&session, axum::http::StatusCode::BAD_REQUEST,
-            "Invalid quota", "Quota must be 0-999 or unlimited.");
-    };
-    let _ = sqlx::query("UPDATE users SET db_quota = $1 WHERE id = $2")
+/// Set a user's quota (None = unlimited). A quota for nobody is not a success.
+pub async fn set_quota_for(state: &AppState, session: &Session, id: Uuid, quota: Option<i32>) -> Result<(), AdminError> {
+    let mut tx = state.db.begin().await.map_err(internal("setting a quota"))?;
+    let changed = sqlx::query("UPDATE users SET db_quota = $1 WHERE id = $2")
         .bind(quota)
         .bind(id)
-        .execute(&state.db)
-        .await;
-    crate::provision::audit(
-        &state.db,
-        &session.username,
-        "set_quota",
-        Some(&id.to_string()),
-        Some(&quota.map_or("unlimited".into(), |q| q.to_string())),
-    )
-    .await;
-    Redirect::to(&format!("/admin/users/{id}?ok=quota_set")).into_response()
+        .execute(&mut *tx)
+        .await
+        .map_err(internal("setting a quota"))?
+        .rows_affected();
+    if changed != 1 {
+        return Err(AdminError::NotFound);
+    }
+    crate::provision::audit_in(&mut tx, &session.actor(), "set_quota", Some(&id.to_string()),
+        Some(&quota.map_or("unlimited".into(), |q| q.to_string())))
+        .await
+        .map_err(internal("auditing a quota"))?;
+    tx.commit().await.map_err(internal("setting a quota"))?;
+    Ok(())
 }
 
-#[derive(Deserialize)]
-pub struct ActiveInput {
-    active: bool,
-}
-
-pub async fn set_active(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    Path(id): Path<Uuid>,
-    Form(input): Form<ActiveInput>,
-) -> Response {
-    // Guard: never let an admin suspend themselves out of access.
+/// Suspend (signing out every session, in the same transaction — a
+/// suspension that leaves live sessions is not one) or enable a user. Never
+/// yourself.
+pub async fn set_active_for(state: &AppState, session: &Session, id: Uuid, active: bool) -> Result<(), AdminError> {
     if id == session.user_id {
-        return Redirect::to("/admin/users").into_response();
+        return Err(AdminError::OwnAccount);
     }
-    let _ = sqlx::query("UPDATE users SET is_active = $1 WHERE id = $2")
-        .bind(input.active)
+    let mut tx = state.db.begin().await.map_err(internal("changing account status"))?;
+    lock_actor_and_target(&mut tx, session.user_id, id).await?;
+    let changed = sqlx::query("UPDATE users SET is_active = $1 WHERE id = $2")
+        .bind(active)
         .bind(id)
-        .execute(&state.db)
-        .await;
-    if !input.active {
-        // Suspension revokes, not just pauses: without this, re-enabling the
-        // user would resurrect every pre-suspension cookie.
-        let _ = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
-            .bind(id)
-            .execute(&state.db)
-            .await;
+        .execute(&mut *tx)
+        .await
+        .map_err(internal("changing account status"))?
+        .rows_affected();
+    if changed != 1 {
+        return Err(AdminError::NotFound);
     }
-    crate::provision::audit(
-        &state.db,
-        &session.username,
-        if input.active { "enable_user" } else { "suspend_user" },
-        Some(&id.to_string()),
-        None,
-    )
-    .await;
-    let ok = if input.active { "user_enabled" } else { "user_suspended" };
-    Redirect::to(&format!("/admin/users/{id}?ok={ok}")).into_response()
+    if !active {
+        // Revokes, not pauses: re-enabling must not resurrect old cookies.
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal("signing out a suspended user"))?;
+    }
+    crate::provision::audit_in(&mut tx, &session.actor(),
+        if active { "enable_user" } else { "suspend_user" }, Some(&id.to_string()), None)
+        .await
+        .map_err(internal("auditing an account status change"))?;
+    tx.commit().await.map_err(internal("changing account status"))?;
+    Ok(())
 }
 
-// ---- databases (all) --------------------------------------------------------
+#[derive(sqlx::FromRow)]
+pub struct AdminDbRow {
+    pub name: String,
+    pub status: String,
+    pub owner: String,
+    pub server_name: String,
+    /// Newest backup of any outcome, so a database whose backups have started
+    /// failing does not read as "covered" (CRYPTARCH-65).
+    pub last_backup_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_backup_status: Option<String>,
+    /// Whether that backup was read back. Carried so this column cannot show a
+    /// plain green "ok" for a backup the database's own page calls unverified.
+    pub last_backup_verified: Option<chrono::DateTime<chrono::Utc>>,
+}
 
-pub async fn databases(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    axum::extract::Query(flash): axum::extract::Query<crate::web::FlashQuery>,
-) -> Response {
-    let rows = sqlx::query_as::<_, AdminDbRow>(
-        "SELECT d.name, d.status, u.username AS owner, s.name AS server_name \
+/// Every database, newest first, with its newest backup — THIS database's,
+/// by identity (CRYPTARCH-86). Joining on the name, as this once did, showed
+/// a database that took a freed name wearing the previous owner's backup.
+/// (Backups of deleted databases have their own view: /admin/backups.)
+pub async fn all_databases(db: &sqlx::PgPool) -> Result<Vec<AdminDbRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminDbRow>(
+        "SELECT d.name, d.status, u.username AS owner, s.name AS server_name, \
+                b.created_at AS last_backup_at, b.status AS last_backup_status, \
+                b.verified_at AS last_backup_verified \
          FROM databases d \
          JOIN users u ON u.id = d.owner_id \
          JOIN managed_servers s ON s.id = d.server_id \
+         LEFT JOIN LATERAL ( \
+             SELECT created_at, status, verified_at FROM backups \
+             WHERE database_id = d.id ORDER BY created_at DESC LIMIT 1 \
+         ) b ON TRUE \
          ORDER BY d.created_at DESC",
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
-    .unwrap_or_default();
-
-    shell(
-        "All databases · Admin",
-        &session,
-        html! {
-            (admin_nav("databases"))
-            h1 { "All databases" }
-            (crate::web::flash_banner(flash.msg()))
-            @if rows.is_empty() {
-                p.muted { "No databases provisioned yet." }
-            } @else {
-                div.table-scroll {
-                    table.dbs {
-                        thead { tr { th { "Name" } th { "Owner" } th { "Server" } th { "Status" } th { "" } } }
-                        tbody {
-                            @for d in &rows {
-                                tr {
-                                    td { a href={ "/db/" (d.name) } { code { (d.name) } } }
-                                    td { (d.owner) }
-                                    td { (d.server_name) }
-                                    td { (status_badge(&d.status)) }
-                                    td {
-                                        @if d.status == "active" {
-                                            (action_button(&d.name, "suspend", "suspend",
-                                                Some(format!("Suspend {}? Live connections will be evicted.", d.name))))
-                                        } @else {
-                                            (action_button(&d.name, "resume", "resume", None))
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .into_response()
 }
 
-// ---- audit ------------------------------------------------------------------
-
-/// Keyset pagination: `?before=<id>` walks toward older entries. Kept as a
-/// String and parsed leniently — a mangled link must not fall through to
-/// axum's bare text 400, it should just show the newest page.
-#[derive(Deserialize, Default)]
-pub struct AuditQuery {
-    before: Option<String>,
+#[derive(sqlx::FromRow, serde::Serialize)]
+pub struct AuditRow {
+    pub id: i64,
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    pub detail: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-const AUDIT_PAGE: i64 = 200;
-
-pub async fn audit_log(
-    State(state): State<AppState>,
-    AdminUser(session): AdminUser,
-    axum::extract::Query(q): axum::extract::Query<AuditQuery>,
-) -> Response {
-    let before: Option<i64> = q.before.as_deref().and_then(|s| s.parse().ok());
+/// One page of the audit log, newest first, older than `before` when given;
+/// with the cursor for the next older page, or None at the start of the log.
+pub async fn audit_page(db: &sqlx::PgPool, before: Option<i64>) -> Result<(Vec<AuditRow>, Option<i64>), sqlx::Error> {
     // Fetch one extra row: a full page proves nothing about whether older
     // entries exist; the peek row does.
     let mut rows = sqlx::query_as::<_, AuditRow>(
@@ -637,111 +380,226 @@ pub async fn audit_log(
     )
     .bind(before)
     .bind(AUDIT_PAGE + 1)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    .fetch_all(db)
+    .await?;
     let has_older = rows.len() as i64 > AUDIT_PAGE;
     rows.truncate(AUDIT_PAGE as usize);
-    let older_cursor = has_older.then(|| rows.last().map(|r| r.id)).flatten();
-
-    shell(
-        "Audit · Admin",
-        &session,
-        html! {
-            (admin_nav("audit"))
-            h1 { "Audit log" }
-            p.muted {
-                "Append-only, newest first, " (AUDIT_PAGE) " per page."
-                @if before.is_some() { " Showing older entries." }
-            }
-            @if rows.is_empty() {
-                p.muted { "Nothing older than this point — you've reached the start of the log." }
-            }
-            div.table-scroll {
-                table.dbs {
-                    thead { tr { th { "When (UTC)" } th { "Actor" } th { "Action" } th { "Target" } th { "Detail" } } }
-                    tbody {
-                        @for a in &rows {
-                            tr {
-                                td.tnum { (a.created_at.format("%Y-%m-%d %H:%M:%S").to_string()) }
-                                td { (a.actor) }
-                                td { code { (a.action) } }
-                                td { @if let Some(t) = &a.target { (t) } }
-                                td.muted { @if let Some(d) = &a.detail { (d) } }
-                            }
-                        }
-                    }
-                }
-            }
-            div.actions {
-                @if before.is_some() {
-                    a.link href="/admin/audit" { "← Newest" }
-                }
-                @if let Some(cursor) = older_cursor {
-                    a.link href={ "/admin/audit?before=" (cursor) } { "Older →" }
-                }
-            }
-        },
-    )
-    .into_response()
+    let older = has_older.then(|| rows.last().map(|r| r.id)).flatten();
+    Ok((rows, older))
 }
+
+// ---- overview ---------------------------------------------------------------
+
+// ---- users ------------------------------------------------------------------
+
+// ---- per-user manage page (CRYPTARCH-36) ------------------------------------
+
+#[derive(sqlx::FromRow, serde::Serialize)]
+pub struct UserDbRow {
+    pub name: String,
+    pub status: String,
+    pub server_name: String,
+}
+
+// ---- create user / reset password (CRYPTARCH-16) ------------------------------
+
+// ---- databases (all) --------------------------------------------------------
+
+// ---- audit ------------------------------------------------------------------
+
+pub const AUDIT_PAGE: i64 = 200;
 
 // ---- rendering helpers ------------------------------------------------------
 
-/// Server context for the sidebar: when set, the sidebar grows a group for
-/// that server (section anchors + settings link) — CRYPTARCH-35.
-pub(crate) struct ServerNavCtx {
-    pub id: uuid::Uuid,
+/// One stranded delete: a database left mid-delete, with the two facts that
+/// decide whether finishing it is safe (render-time only; the destructive
+/// path re-reads them at action time).
+pub struct Stranded {
     pub name: String,
-    /// "detail" | "settings" — which server page is showing.
-    pub here: &'static str,
+    /// `None`: the server could not be asked (or is not in service). Unknown
+    /// is never read as "no" — that rendered "no data left to lose" about a
+    /// database nobody had looked at (S6b/c audit P2).
+    pub can_log_in: Option<bool>,
+    pub db_exists: Option<bool>,
 }
 
-/// Admin sidebar; `here` highlights the current section. Rendered as a
-/// direct child of `main.wrap`, which the CSS turns into a two-column
-/// console layout (`main.wrap:has(> nav.sidenav)`).
-pub(crate) fn admin_nav(here: &str) -> Markup {
-    admin_sidebar(here, None)
+impl Stranded {
+    /// Offered only when destruction demonstrably began: both facts known,
+    /// and the login off (a delete turns it off first). Login on means the
+    /// delete never started — or, with the database absent, someone else's
+    /// provision in flight under this name. Unknown is not offered.
+    pub fn retryable(&self) -> bool {
+        self.can_log_in == Some(false) && self.db_exists.is_some()
+    }
 }
 
-pub(crate) fn admin_sidebar(here: &str, server: Option<&ServerNavCtx>) -> Markup {
-    html! {
-        nav.sidenav aria-label="Admin sections" {
-            div.navgroup {
-                span.navlabel { "Portal" }
-                a href="/admin" .active[here == "overview"] { "Overview" }
+/// Everything the login report shows.
+pub struct LoginReport {
+    pub reports: Vec<crate::repair::ServerReport>,
+    pub stranded: Vec<Stranded>,
+    /// (server name, detail): servers the one-time CRYPTARCH-78 repair could
+    /// not reach. DISPLAY ONLY (see migration 0016).
+    pub unreachable_at_upgrade: Vec<(String, String)>,
+}
+
+/// The CRYPTARCH-78 login report, surveyed live, every server concurrently.
+pub async fn login_report(state: &AppState) -> LoginReport {
+    // Enumerated from METADATA, not from the live registry. A server an admin
+    // has disabled is removed from the registry entirely (`unregister` drops
+    // it from both maps) while its metadata row, its databases and its roles
+    // all remain. Enumerating from the registry would give it no report row at
+    // all — and Tier A skips it too, so each tier's silence would be justified
+    // by the other's responsibility while a disabled login stayed disabled.
+    let servers: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM managed_servers ORDER BY name")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+
+    // Concurrent, not serial. Each survey is bounded by TimeoutEngine, but a
+    // serial loop makes the worst case N × that bound — one hanging box would
+    // slow the page down on every other server's behalf. They are independent
+    // by construction.
+    let mut tasks = tokio::task::JoinSet::new();
+    for (id, name) in servers {
+        let state = state.clone();
+        tasks.spawn(async move {
+                let known_databases: Option<i64> = sqlx::query_scalar(
+                    "SELECT count(*) FROM databases WHERE server_id = $1",
+                )
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .ok();
+
+                let survey = if state.servers.get(id).is_none() {
+                    // Registered, but not in live service. Not a failure, and
+                    // therefore nothing else would ever be loud about it.
+                    crate::repair::Survey {
+                        server_id: id,
+                        coverage: crate::repair::SurveyCoverage::NotSurveyed {
+                            reason: "This server is disabled, so it was not surveyed.".into(),
+                        },
+                        disabled: Vec::new(),
+                        unknown_to_metadata: Vec::new(),
+                    }
+                } else {
+                    // A survey that fails outright still produces a row, as
+                    // Unreachable — a server missing from the list would be
+                    // indistinguishable from one with nothing to say.
+                    crate::repair::survey_disabled_logins(&state.db, &state.servers, id)
+                        .await
+                        .unwrap_or_else(|e| crate::repair::Survey {
+                            server_id: id,
+                            coverage: crate::repair::SurveyCoverage::Unreachable {
+                                detail: format!("{e:#}"),
+                            },
+                            disabled: Vec::new(),
+                            unknown_to_metadata: Vec::new(),
+                        })
+                };
+            crate::repair::ServerReport { server_name: name, survey, known_databases }
+        });
+    }
+    let mut reports: Vec<crate::repair::ServerReport> = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        // A panicked survey task must not silently remove a server from the
+        // report; it is logged and the server is simply absent from THIS
+        // collection, which the count check below would then notice.
+        match joined {
+            Ok(r) => reports.push(r),
+            Err(e) => tracing::error!("login report: a server survey task failed: {e}"),
+        }
+    }
+    // Concurrency reorders; the renderer sorts by coverage, so give it a
+    // stable base ordering rather than whatever finished first.
+    reports.sort_by(|a, b| a.server_name.cmp(&b.server_name));
+
+    // Servers whose one repair attempt was never spent because they could not
+    // be reached at upgrade. Nothing will ever retry them — an admin has to
+    // finish the job by hand — so the obligation must outlive the single
+    // `warn!` emitted during that boot.
+    //
+    // DISPLAY ONLY. `0016_repair_78.sql` forbids BRANCHING on these rows;
+    // rendering them is the use they exist for.
+    // Rows mid-delete, with the two facts that decide whether finishing is
+    // safe. Render-time only: the destructive path re-reads them from the
+    // server at action time, because this page is read slowly and the
+    // maintenance sweep can change the answer while it is on screen.
+    let mut stranded: Vec<Stranded> = Vec::new();
+    let deleting: Vec<(String, Uuid)> =
+        sqlx::query_as("SELECT name, server_id FROM databases WHERE status = 'deleting'")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+    for (name, server_id) in deleting {
+        // A server out of service still has the row listed — as unknown,
+        // never skipped (the report would otherwise not show it at all).
+        let Some(engine) = state.servers.get(server_id) else {
+            stranded.push(Stranded { name, can_log_in: None, db_exists: None });
+            continue;
+        };
+        let can_log_in = engine
+            .login_states(crate::repair::PANEL_OWNED_ROLES)
+            .await
+            .ok()
+            .map(|rs| rs.iter().any(|r| r.role_name == name && r.can_login));
+        let db_exists = engine.database_exists(&name).await.ok();
+        stranded.push(Stranded { name, can_log_in, db_exists });
+    }
+
+    let unreachable_at_upgrade: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.name, r.detail FROM repair_unreachable_78 r \
+         JOIN managed_servers s ON s.id = r.server_id ORDER BY s.name",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    LoginReport { reports, stranded, unreachable_at_upgrade }
+}
+
+/// Why finishing a stranded delete was refused.
+#[derive(Debug)]
+pub enum RetryError {
+    /// The typed name did not match.
+    ConfirmMismatch,
+    /// No database by that name any more.
+    Gone,
+    /// Re-checked at action time and found unsafe or moot.
+    Refused(crate::provision::RetryRefusal),
+    Failed,
+}
+
+/// Finish a delete that stopped partway. Typed confirmation, like delete; the
+/// server is re-checked inside `provision::retry_delete`, because the report
+/// is read slowly and the maintenance sweep can change the answer meanwhile.
+pub async fn retry_delete_for(state: &AppState, session: &Session, name: &str, confirm: &str) -> Result<(), RetryError> {
+    // Trimmed, as delete's is: the dialog arms on the trimmed name, so a
+    // stray space must not arm the button and then be refused here.
+    if confirm.trim() != name {
+        return Err(RetryError::ConfirmMismatch);
+    }
+    let lookup = match crate::provision::find_db(&state.db, name).await {
+        Ok(Some(l)) => l,
+        Ok(None) => return Err(RetryError::Gone),
+        Err(_) => return Err(RetryError::Failed),
+    };
+    match crate::provision::retry_delete(&state.db, &state.servers, &lookup, name, &session.actor()).await {
+        Ok(Ok(())) => {
+            // Ends the way a delete does (web::delete_request): the edge stops
+            // admitting it, and anything still connected is evicted.
+            if let Err(e) = crate::acl::sync_edge(&state.db, &state.crypto, lookup.server_id).await {
+                tracing::warn!("finished deleting '{name}', but the edge sync failed: {e:#}");
             }
-            div.navgroup {
-                span.navlabel { "Access" }
-                a href="/admin/users" .active[here == "users"] { "Users" }
-                a href="/admin/audit" .active[here == "audit"] { "Audit" }
-            }
-            div.navgroup {
-                span.navlabel { "Fleet" }
-                a href="/admin/databases" .active[here == "databases"] { "Databases" }
-                a href="/admin/servers" .active[here == "servers"] { "Servers" }
-            }
-            @if let Some(srv) = server {
-                div.navgroup {
-                    span.navlabel { code { (srv.name) } }
-                    a href={ "/admin/servers/" (srv.id) "#dashboard" } .active[srv.here == "detail"] { "Dashboard" }
-                    a href={ "/admin/servers/" (srv.id) "#edge" } { "Edge health" }
-                    a href={ "/admin/servers/" (srv.id) "#pools" } { "Pool overrides" }
-                    a href={ "/admin/servers/" (srv.id) "#sources" } { "Named sources" }
-                    a href={ "/admin/servers/" (srv.id) "#listeners" } { "Listeners" }
-                    a href={ "/admin/servers/" (srv.id) "/settings" } .active[srv.here == "settings"] { "Settings" }
-                }
-            }
+            crate::acl::kill_db_sessions(&state.db, &state.crypto, lookup.server_id, name).await;
+            Ok(())
+        }
+        Ok(Err(why)) => Err(RetryError::Refused(why)),
+        Err(e) => {
+            tracing::error!("retry delete of '{name}' failed: {e}");
+            Err(RetryError::Failed)
         }
     }
 }
 
-/// A small POST-form button for a db lifecycle action (admin acts on any db).
-/// `confirm`: optional hx-confirm prompt for destructive verbs.
-fn action_button(name: &str, verb: &str, label: &str, confirm: Option<String>) -> Markup {
-    html! {
-        form method="post" action={ "/db/" (name) "/" (verb) } .inline hx-confirm=[confirm] {
-            button.link type="submit" aria-label={ (label) " database " (name) } { (label) }
-        }
-    }
-}

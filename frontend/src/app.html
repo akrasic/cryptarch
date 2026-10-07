@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="text-scale" content="scale" />
+		<!-- Static, not added by JS: browsers request /favicon.ico before any
+		     script runs unless the page names its icon up front. -->
+		<link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+		<link rel="preload" href="/static/fonts/figtree-var.woff2" as="font" type="font/woff2" crossorigin />
+		<link rel="preload" href="/static/fonts/dm-mono-400.woff2" as="font" type="font/woff2" crossorigin />
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<!-- No inline style: the CSP is style-src 'self'. See app-shell.css. -->
+		<div class="sk-root">%sveltekit.body%</div>
+	</body>
+</html>

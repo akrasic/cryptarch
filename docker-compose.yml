@@ -16,7 +16,11 @@ services:
   db:
     image: postgres:18
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # `:?` rather than a bare ${...}: compose turns a missing .env line into
+      # the EMPTY STRING and carries on with one easily-missed warning, which
+      # for a password means the stack comes up looking healthy with no
+      # password at all (CRYPTARCH-105). Fail the deploy instead.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: cryptarch
     volumes:
       - cryptarch_pgdata:/var/lib/postgresql/data
@@ -28,10 +32,25 @@ services:
     build: .
     depends_on: [db]
     environment:
-      CRYPTARCH_METADATA_DSN: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/cryptarch
+      CRYPTARCH_METADATA_DSN: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/cryptarch
+      # Inside the container. What the host publishes is APP_BIND below.
       CRYPTARCH_BIND: 0.0.0.0:8080
       CRYPTARCH_ADMIN: ${CRYPTARCH_ADMIN:-admin}
-      CRYPTARCH_ADMIN_PASSWORD: ${CRYPTARCH_ADMIN_PASSWORD}
+      # See POSTGRES_PASSWORD above for why `:?`. The app now also refuses to
+      # boot on an empty or too-short value, so this is the second of two
+      # guards — compose catches it before the image is even started.
+      CRYPTARCH_ADMIN_PASSWORD: ${CRYPTARCH_ADMIN_PASSWORD:?set CRYPTARCH_ADMIN_PASSWORD in .env}
+      # Session cookies are marked Secure by default, so sign-in works only
+      # over https:// (or http://localhost). Until there is TLS in front of
+      # this, reaching it by plain http on a LAN address makes login fail
+      # SILENTLY — the browser drops the cookie and you bounce back to the
+      # sign-in page as though the password were wrong (CRYPTARCH-103). Set
+      # this to 1 to accept that risk on a trusted network.
+      CRYPTARCH_INSECURE_COOKIES: ${CRYPTARCH_INSECURE_COOKIES:-}
+      # Who may reach the bouncer's admin console. Must match the `backend`
+      # network's subnet below — NOT the `db` network, which is attachable and
+      # is where tenant containers live (CRYPTARCH-104).
+      CRYPTARCH_CONSOLE_CIDR: ${BACKEND_NETWORK_SUBNET:-172.19.0.0/16}
       CRYPTARCH_DEFAULT_QUOTA: ${CRYPTARCH_DEFAULT_QUOTA:-3}
       CRYPTARCH_SEED_SERVER_DSN: ${CRYPTARCH_SEED_SERVER_DSN}
       CRYPTARCH_SEED_SERVER_NAME: ${CRYPTARCH_SEED_SERVER_NAME:-default}
@@ -51,20 +70,138 @@ services:
       CRYPTARCH_HEALTH_INTERVAL_SECS: ${CRYPTARCH_HEALTH_INTERVAL_SECS:-60}
       CRYPTARCH_NOTIFY_URL: ${CRYPTARCH_NOTIFY_URL:-}
       CRYPTARCH_NOTIFY_FORMAT: ${CRYPTARCH_NOTIFY_FORMAT:-ntfy}
+      # Prometheus scrape (CRYPTARCH-98). Cryptarch exports for the servers it
+      # MANAGES — it already holds their admin credentials, so a server is
+      # scraped the moment it is registered rather than when someone remembers
+      # to add it to an exporter's config.
+      #
+      # A token is required rather than optional: this port is published on
+      # every interface below, and /metrics carries tenant database names.
+      # Unset it and /metrics returns 404. Generate one with:
+      #   openssl rand -hex 32
+      # and give Prometheus `bearer_token` in the scrape config.
+      #
+      # NOT covered here, and both worth adding beside this stack: the metadata
+      # database (postgres_exporter against `db`) and the bouncer
+      # (pgbouncer_exporter). Neither is reached through the engine registry,
+      # so neither is Cryptarch's to export.
+      CRYPTARCH_METRICS_TOKEN: ${CRYPTARCH_METRICS_TOKEN:-}
       # At-rest encryption key for stored admin DSNs. Generate once on the host:
       #   (umask 077; openssl rand -hex 32 > cryptarch.key)
       # and keep it out of any backup that also holds the metadata DB.
       CRYPTARCH_KEY_FILE: /run/secrets/cryptarch_key
+      # Backups (CRYPTARCH-57). Blobs are sealed with the key above — a backup
+      # directory without that key restores nothing, which is why the key goes
+      # offline separately.
+      #
+      # This was a hardcoded /backups while the README and .env.example both
+      # said "leave CRYPTARCH_BACKUP_DIR unset and the feature stays off"
+      # (CRYPTARCH-108). It was not off: unsetting CRYPTARCH_BACKUP_DIR_HOST
+      # only moved the host mount. An operator who believed backups were
+      # disabled got nightly dumps of every database, sealed with a key they
+      # had never copied offline BECAUSE they thought the feature was idle.
+      # Set this empty to actually turn backups off.
+      CRYPTARCH_BACKUP_DIR: ${CRYPTARCH_BACKUP_DIR:-/backups}
+      # Sweep interval (0 = manual only), successful backups kept per database,
+      # and the age at which a database's newest good backup raises an alert
+      # through the same notifier as health.
+      CRYPTARCH_BACKUP_INTERVAL_SECS: ${CRYPTARCH_BACKUP_INTERVAL_SECS:-86400}
+      CRYPTARCH_BACKUP_KEEP: ${CRYPTARCH_BACKUP_KEEP:-7}
+      CRYPTARCH_BACKUP_STALE_AFTER_SECS: ${CRYPTARCH_BACKUP_STALE_AFTER_SECS:-172800}
     volumes:
-      - ${CRYPTARCH_KEY_FILE_HOST:-./cryptarch.key}:/run/secrets/cryptarch_key:ro
+      # Defaults live OUTSIDE the stack directory on purpose (CRYPTARCH-108).
+      # They used to be ./cryptarch.key and ./backups — inside the git clone
+      # the README tells you to make. That put the AES key that decrypts every
+      # blob AND every stored admin DSN one `git add -A` from being published,
+      # and put the blobs themselves one `git clean -fdx` (or one stack
+      # re-clone, which is how Komodo redeploys) from being erased. It also
+      # placed key and ciphertext in the same directory, which is exactly what
+      # the note above says not to do.
+      - ${CRYPTARCH_KEY_FILE_HOST:-/srv/cryptarch/cryptarch.key}:/run/secrets/cryptarch_key:ro
+      # A host path, not a named volume, on purpose: backups you cannot rsync
+      # off the box with ordinary tools are not much of a backup.
+      - ${CRYPTARCH_BACKUP_DIR_HOST:-/srv/cryptarch/backups}:/backups
       # Shared with the bouncer: CRYPTARCH-11/12 render pgbouncer_hba.conf
       # here and RELOAD via the console. The app writes as root (no USER in
       # Dockerfile); the bouncer reads as uid 70 — renderer must write 0644.
       - bouncer_conf:/etc/pgbouncer
     ports:
-      - "${APP_PORT:-8080}:8080"
+      # Loopback by default, like every other published port in this file
+      # (CRYPTARCH-106). This one is the login form, the admin console and the
+      # one-time connection strings, and it was the single service published on
+      # 0.0.0.0 — so `docker compose up -d` on a box with a public interface
+      # put the provisioning portal on the internet. Set APP_BIND=0.0.0.0 if
+      # you really want that; the intended path is a reverse proxy in front.
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080"
     # Backend reaches the metadata db and the bouncer console; the web UI is
     # published above, so the app needs no presence on the consumer network.
+    networks: [backend]
+    restart: unless-stopped
+    # Above the app's whole shutdown budget (CRYPTARCH-123): up to 8s for HTTP
+    # requests to finish, then up to 20s for background jobs. Docker's default
+    # is 10s, after which it SIGKILLs — skipping the job cleanup entirely.
+    stop_grace_period: 40s
+
+  # ---- Prometheus exporters -------------------------------------------
+  #
+  # Standard community exporters so any Prometheus can scrape this stack and
+  # the off-the-shelf Postgres/PgBouncer dashboards and alert rules work
+  # unmodified. These cover what the STACK owns: its own metadata database and
+  # its edge.
+  #
+  # They do NOT cover the managed servers you provision onto — those are
+  # configured at runtime through the UI, so the stack cannot know them at
+  # compose time. Add one postgres-exporter per managed server (or use
+  # postgres-exporter's multi-target `/probe` endpoint), with a read-only role:
+  #   CREATE ROLE cryptarch_monitor LOGIN PASSWORD '...';
+  #   GRANT pg_monitor TO cryptarch_monitor;
+  # Cryptarch's own /metrics (CRYPTARCH_METRICS_TOKEN above) reports the
+  # inventory and a small set of early-warning numbers for every managed
+  # server; it is not a substitute for these, and these are not a substitute
+  # for it.
+  metrics-db:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    depends_on: [db]
+    environment:
+      # Read-only usage; the role still needs pg_monitor for the full view.
+      # This uses the stack's postgres superuser because the metadata database
+      # is not multi-tenant — if you would rather not, create a monitor role in
+      # it and point this at that instead.
+      DATA_SOURCE_NAME: postgresql://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/cryptarch?sslmode=disable
+    ports:
+      # Bind to the private interface by default, like the bouncer: metrics are
+      # not secret in the way credentials are, but they are not for everyone.
+      - "${METRICS_BIND:-127.0.0.1}:${PG_EXPORTER_PORT:-9187}:9187"
+    networks: [backend]
+    restart: unless-stopped
+
+  metrics-bouncer:
+    image: quay.io/prometheuscommunity/pgbouncer-exporter:v0.11.0
+    depends_on: [bouncer]
+    # Connects to the bouncer's virtual `pgbouncer` database and reads
+    # SHOW STATS/POOLS/LISTS. The user must be in `stats_users` (or
+    # `admin_users`) in pgbouncer.ini — the seed config ships `pgbstats` as a
+    # stats-only user, which cannot RELOAD or SHUTDOWN the way the admin can.
+    #
+    # NOTE for existing deployments: bouncer-seed/ is copied on FIRST deploy
+    # only, and bouncer-init short-circuits on an existing pgbouncer.ini. An
+    # already-running stack therefore keeps its own copy in the bouncer_conf
+    # volume and gains NONE of this automatically:
+    #   * `stats_users` — add it and RELOAD, or this container restart-loops;
+    #   * the generated userlist.txt — the old committed one, WITH ITS
+    #     PUBLISHED PASSWORDS, is still in force. Rotate both console passwords
+    #     in the volume by hand; that is the entire point of CRYPTARCH-104 and
+    #     it does not apply itself to a stack that already exists.
+    # Password via PGPASSWORD, not in `command:` (CRYPTARCH-104). Anything in
+    # argv is readable from `docker inspect`, from `ps` on the host, and from
+    # /proc/<pid>/cmdline — a strictly worse hiding place than the environment,
+    # which is already the compromise the rest of this file makes.
+    environment:
+      PGPASSWORD: ${BOUNCER_STATS_PASSWORD:?set BOUNCER_STATS_PASSWORD in .env}
+    command:
+      - --pgBouncer.connectionString=postgres://pgbstats@bouncer:6432/pgbouncer?sslmode=disable
+    ports:
+      - "${METRICS_BIND:-127.0.0.1}:${BOUNCER_EXPORTER_PORT:-9127}:9127"
     networks: [backend]
     restart: unless-stopped
 
@@ -77,7 +214,42 @@ services:
     volumes:
       - bouncer_conf:/conf
       - ./bouncer-seed:/seed:ro
-    command: sh -c "if [ ! -f /conf/pgbouncer.ini ]; then cp /seed/* /conf/ && chmod 644 /conf/* && echo seeded; else echo already-seeded; fi"
+    environment:
+      # No defaults (CRYPTARCH-104). userlist.txt used to ship with real,
+      # working passwords committed in this repo — and there was no variable
+      # to change them, so every deployment shared a console credential
+      # anyone could read here. `:?` makes compose refuse to start instead.
+      BOUNCER_ADMIN_PASSWORD: ${BOUNCER_ADMIN_PASSWORD:?set BOUNCER_ADMIN_PASSWORD in .env}
+      BOUNCER_STATS_PASSWORD: ${BOUNCER_STATS_PASSWORD:?set BOUNCER_STATS_PASSWORD in .env}
+    # userlist.txt is generated here rather than copied, so no password for it
+    # exists in the repo at all. 0600 on the secret file specifically: the
+    # bouncer runs as uid 70, hence the chown; the ini and hba stay 0644.
+    #
+    # A LITERAL block scalar (`|`), not a folded one (`>`). Folding turned the
+    # printf into two commands — the more-indented continuation line kept its
+    # newline, so `printf` ran with no arguments and no redirection and the
+    # password value became the next command name. That produced an empty
+    # userlist, skipped the chmod/chown, and exited 127. `|` keeps the shell
+    # exactly as written.
+    #
+    # The passwords stay printf ARGUMENTS rather than being interpolated into
+    # the format string, so `$`, backticks, quotes and backslashes in a
+    # password reach the file verbatim instead of being re-read by the shell.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ -f /conf/pgbouncer.ini ]; then echo already-seeded; exit 0; fi
+        # Every seed file, not a hand-listed subset: pgbouncer.ini ends with
+        # `%include cryptarch_bouncer.ini`, and pgbouncer FATALs on a missing
+        # include target rather than skipping it.
+        cp /seed/. /conf/ -r
+        chmod 644 /conf/pgbouncer.ini /conf/pgbouncer_hba.conf /conf/cryptarch_bouncer.ini
+        printf '"pgbadmin" "%s"\n"pgbstats" "%s"\n' "$$BOUNCER_ADMIN_PASSWORD" "$$BOUNCER_STATS_PASSWORD" > /conf/userlist.txt
+        chmod 600 /conf/userlist.txt
+        chown 70:70 /conf/userlist.txt
+        echo seeded
     network_mode: none
     restart: "no"
 
@@ -120,7 +292,20 @@ networks:
       config:
         - subnet: ${DB_NETWORK_SUBNET:-172.18.0.0/16}
   # Stack-internal; deliberately NOT attachable and not named for joining.
+  #
+  # Subnet pinned (CRYPTARCH-104) because the bouncer's admin console is now
+  # scoped to it: Cryptarch and the exporters live here, tenants live on `db`
+  # above, and the console rule has to be able to name the difference.
+  #
+  # Change BACKEND_NETWORK_SUBNET alone — CRYPTARCH_CONSOLE_CIDR above already
+  # follows it. And do change it if `docker compose up` reports "Pool overlaps
+  # with other one on this address space": docker hands out 172.17, 172.18,
+  # 172.19 … in order, so on a box already running a few stacks this default
+  # collides. The failure is loud and immediate, not silent.
   backend:
+    ipam:
+      config:
+        - subnet: ${BACKEND_NETWORK_SUBNET:-172.19.0.0/16}
 
 volumes:
   cryptarch_pgdata:

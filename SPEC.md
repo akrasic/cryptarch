@@ -43,12 +43,12 @@ trait DbEngine {
 - **User**: authenticates (OIDC via Entra, or local accounts to start). Has a `db_quota` (default e.g. 3). Sees only their own databases. Provisions up to quota, manages (rotate/suspend/delete) their own, cannot see or touch anyone else's.
 - **Admin**: superuser of the *panel* (not of Postgres). Sees all users and all databases. Sets/overrides per-user quotas, suspends users, views the global audit log. First admin bootstrapped from env.
 - **Database record**: name, owner (panel user), owner role (pg), created_at, status (active/suspended), size (`pg_database_size`), last-connection (`pg_stat_activity`).
-- **Provisioning action** = one transaction, quota-checked first: verify `user.active_db_count < user.db_quota` → `CREATE ROLE x LOGIN PASSWORD ...` → `CREATE DATABASE x_db OWNER x` → `REVOKE CONNECT ... FROM PUBLIC` → record ownership → return connection string once (stored only as hash; shown one time, Entra-style).
+- **Provisioning action** = reserve, then build: in one metadata transaction, lock the user row (`FOR UPDATE`), verify the slots the user holds (every database row except those in a status that frees its slot) are below `user.db_quota`, insert the ownership row, commit. *Then*, outside that transaction, `CREATE ROLE x LOGIN PASSWORD ...` → `CREATE DATABASE x_db OWNER x` → `REVOKE CONNECT ... FROM PUBLIC` on the managed server, deleting the reservation if that fails → return connection string once (stored only as hash; shown one time, Entra-style).
 
 ## Quota + ownership model (the crux)
 
 - Panel keeps its *own* small metadata DB (users, databases, quotas, audit) — separate from the databases it provisions. This is the source of truth for "who owns what" and "how many is Alice allowed."
-- Every provision checks quota in the same transaction that creates the role, so two rapid clicks can't race past the cap.
+- Every provision reserves its quota slot by writing the `databases` row under a `FOR UPDATE` lock on the user, and commits that before touching the managed server. Two rapid clicks can't race past the cap: the second blocks on the lock, then counts the first one's committed row. The engine call stays outside the transaction on purpose, so a slow remote `CREATE DATABASE` never holds a metadata pool connection.
 - Suspend a user → all their pg roles get `NOLOGIN`, databases stay intact (reversible). Delete a user → typed-name confirm, cascades to their databases (the irreversible door).
 - Quota is a soft integer per user; admin can bump it. A global default lives in config.
 
@@ -64,6 +64,7 @@ trait DbEngine {
 
 - **Backend**: one Go or Rust binary (you speak both; Rust keeps it a single static binary next to the DB). Talks to Postgres over the `db` network with an admin role scoped to CREATEROLE + CREATEDB — *not* superuser (principle of least privilege; the panel can't drop the server).
 - **Frontend**: server-rendered HTML + a little htmx, or a tiny SPA — no build-tool circus for something this size. It's five screens.
+  *(2026-10-07: it outgrew that. The UI is now a SvelteKit SPA over a JSON API, compiled into the same single binary — see dec-cryptarch-sveltekit-architecture and CLAUDE.md.)*
 - **Auth**: start with a single admin credential in env; graft OIDC/Entra later (same flow as Komodo — `/auth/oidc/callback`).
 - **Deploy**: one container on the `db` network, behind the existing proxy. Compose stanza ships with it.
 
@@ -79,6 +80,7 @@ trait DbEngine {
 ## Stack detail (Rust)
 
 - **axum** (web) + **sqlx** (Postgres, compile-time-checked queries) + **askama** or **maud** for server-rendered HTML + **htmx** sprinkled for the interactive bits (modal, copy-once, live quota counter). No JS build step.
+  *(Superseded 2026-10-07: maud and htmx were replaced by a SvelteKit SPA and the `/api/v1` JSON API; the deploy is still one binary.)*
 - Sessions: signed cookie (tower-sessions). Passwords/tokens: `argon2`. CSPRNG via `rand`.
 - Panel connects as a dedicated pg role: `CREATEDB CREATEROLE`, never superuser.
 - Single binary + one `Dockerfile` (scratch/distroless final stage) + compose stanza on the `db` network.

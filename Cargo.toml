@@ -2,18 +2,27 @@
 name = "cryptarch"
 version = "0.1.0"
 edition = "2024"
-# Edition 2024 floor; matches CI/Dockerfile toolchain.
-rust-version = "1.85"
+# No rust-version on purpose. It read "matches CI/Dockerfile toolchain" and did
+# not: the Dockerfile builds on `rust:1-slim` and CI uses
+# dtolnay/rust-toolchain@stable, so both already track latest stable and nothing
+# anywhere pinned 1.85 except this line. What it DID do was hold cargo's
+# MSRV-aware resolver at 1.85 and silently refuse newer releases of a dozen
+# transitive crates on a machine running 1.97.
+#
+# This project tracks latest stable deliberately (Antun, 2026-07-21). The cost
+# is that someone on an old toolchain gets an edition-2024 error rather than a
+# clear MSRV message; that is worth it here, where CI and the image are the
+# only builders that matter.
 description = "Self-service, multi-engine, multi-server database provisioning portal"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = "0.7"
-axum-extra = { version = "0.9", features = ["cookie", "form"] }
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["cookie", "form"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["trace", "set-header"] }
+tower-http = { version = "0.7", features = ["trace", "set-header"] }
 serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
 # PgBouncer's admin console speaks only the simple query protocol; sqlx's
 # prepared statements break on it. tokio-postgres has simple_query.
 tokio-postgres = "0.7"
@@ -21,14 +30,25 @@ tokio-postgres = "0.7"
 # in DDL (they'd land in the managed server's statement logs otherwise).
 postgres-protocol = "0.6"
 # Checksum header on rendered edge config, for drift detection.
-sha2 = "0.10"
+sha2 = "0.11"
 # Health notifications (CRYPTARCH-43): ntfy / webhook delivery.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 serde_json = "1"
-maud = { version = "0.26", features = ["axum"] }
 argon2 = "0.5"
-aes-gcm = "0.10"
-rand = "0.8"
+# Constant-time comparison for the metrics scrape token. Already in the tree
+# transitively (argon2, aes-gcm); named here because we rely on it directly.
+subtle = "2"
+# Not used directly — this enables `password-hash/getrandom`, which is what
+# puts `OsRng` in scope for `SaltString::generate` in auth.rs. argon2's own
+# defaults do NOT enable it: until rand 0.10, it was switched on by accident
+# because rand 0.8 shared rand_core 0.6 and turned its `getrandom` feature on
+# through feature unification. Every stored password's salt depended on that
+# coincidence. Declared here so it depends on nothing but this line.
+password-hash = { version = "0.5", features = ["getrandom"] }
+# `rand_core` exposes the `Generate` trait that replaced `generate_nonce`.
+# `getrandom` (default) is what backs it with the OS CSPRNG.
+aes-gcm = { version = "0.11", features = ["rand_core"] }
+rand = "0.10"
 async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
@@ -36,3 +56,5 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust-embed = { version = "8.12.0", features = ["mime-guess"] }
+base64 = "0.23.1"

@@ -2,3 +2,15 @@
 /.env
 /.dev-key
 /dev-bouncer/
+
+# CRYPTARCH-108. The compose defaults now point outside the stack directory,
+# but the README still has you generating a key with openssl in whatever
+# directory you are standing in — and `git status` showing `cryptarch.key` as
+# untracked is one `git add -A` away from publishing the AES-256 key that
+# decrypts every backup blob and every stored managed-server admin DSN.
+# Losing that key is documented as unrecoverable; leaking it was not.
+/cryptarch.key
+
+# Backups, if anyone points them here anyway. They are large, they are
+# sealed data, and this directory is one `git clean -fdx` from gone.
+/backups/

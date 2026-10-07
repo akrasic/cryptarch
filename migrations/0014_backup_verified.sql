@@ -1,0 +1,12 @@
+-- CRYPTARCH-68: record what was DONE, not what was configured.
+--
+-- With verification on, status='ok' means "sealed and read back in full". With
+-- CRYPTARCH_BACKUP_VERIFY=0 the same value means only "sealed" — same column,
+-- same green badge, weaker claim. An operator who set that flag months ago, or
+-- inherited it in a compose file, reads 'ok' as verified when it is not.
+--
+-- NULL is the honest answer for both "we did not check" and "this backup
+-- predates checking", which are the same claim. Every row written before this
+-- migration is therefore correctly unverified rather than retroactively
+-- credited.
+ALTER TABLE backups ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;

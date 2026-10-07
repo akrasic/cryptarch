@@ -97,6 +97,17 @@ impl ServerRegistry {
         self.0.read().unwrap().engines.get(&id).cloned()
     }
 
+    /// Every server we hold a live engine for.
+    ///
+    /// Deliberately not [`ServerRegistry::list`], which answers "what can a
+    /// user provision onto" and may legitimately be narrower. Maintenance
+    /// passes want every server they can actually reach — a server excluded
+    /// from the picker still has databases on it, and skipping it would make
+    /// "not surveyed" indistinguishable from "surveyed, nothing found".
+    pub fn ids(&self) -> Vec<Uuid> {
+        self.0.read().unwrap().engines.keys().copied().collect()
+    }
+
     /// Servers available to provision onto, for the picker.
     pub fn list(&self) -> Vec<ServerInfo> {
         self.0.read().unwrap().info.clone()
@@ -148,6 +159,12 @@ pub async fn connect_row(
     };
 
     let check = check_admin_role(&dsn).await.context("role gate check")?;
+    if let Some(why) = check.version_refusal() {
+        anyhow::bail!("{why}");
+    }
+    if let Some(why) = check.switch_refusal() {
+        anyhow::bail!("{why}");
+    }
     if check.is_superuser && !allow_superuser {
         anyhow::bail!(
             "admin role '{}' is SUPERUSER — refused (set CRYPTARCH_ALLOW_SUPERUSER_ADMIN=1 only for dev)",
@@ -169,15 +186,63 @@ pub async fn connect_row(
     ))
 }
 
-/// What `SELECT ... FROM pg_roles WHERE rolname = current_user` says about a
-/// candidate admin DSN. The CRUD refuses superuser and demands both create
-/// attributes — the security spine, enforced at the door.
+/// What the server says about a candidate admin DSN's role. The CRUD refuses
+/// superuser and demands both create attributes — the security spine,
+/// enforced at the door.
+///
+/// THE LOGIN, NOT JUST THE CURRENT ROLE (S8b audit P1). A DSN can carry
+/// `options=-c role=x`: the connection authenticates as one role and then
+/// acts as another, so `current_user` alone would vet `x` while the stored
+/// credential is the login's — a superuser's, recoverable with `SET ROLE
+/// NONE`. So the check reads `session_user` too, refuses a DSN whose role
+/// differs from its login, and counts as superuser a login that is a member
+/// of any superuser role, since it can `SET ROLE` to it.
 pub struct RoleCheck {
     pub role: String,
+    /// `session_user`: who the DSN authenticates as.
+    pub login: String,
+    /// The login or the role is a superuser, or the login is a member of a
+    /// superuser role.
     pub is_superuser: bool,
     pub can_createdb: bool,
     pub can_createrole: bool,
     pub server_version: String,
+    /// `server_version_num`, e.g. 180006 — compared, never parsed from the text.
+    pub server_version_num: i32,
+}
+
+/// The oldest PostgreSQL a managed server may run (CRYPTARCH-128).
+///
+/// Restores depend on two things PostgreSQL 14 introduced: `pg_locks.waitstart`,
+/// which is how the lock watchdog measures a wait, and
+/// `client_connection_check_interval`, which is what stops a dead restore client
+/// leaving its backend queued. On 13 the second is an unknown startup option, so
+/// EVERY restore would fail at connect — refused at the door instead.
+pub const MIN_SERVER_VERSION_NUM: i32 = 140000;
+
+impl RoleCheck {
+    /// Why this DSN is refused for acting as a role other than the one it
+    /// logs in as, if it does.
+    pub fn switch_refusal(&self) -> Option<String> {
+        (self.login != self.role).then(|| {
+            format!(
+                "the DSN logs in as '{}' and then acts as '{}' — connect as the panel role \
+                 itself, without a role option",
+                self.login, self.role
+            )
+        })
+    }
+
+    /// Why this server is too old to manage, if it is.
+    pub fn version_refusal(&self) -> Option<String> {
+        (self.server_version_num < MIN_SERVER_VERSION_NUM).then(|| {
+            format!(
+                "PostgreSQL {} is too old — Cryptarch needs 14 or newer (restores rely on \
+                 features 14 introduced)",
+                self.server_version
+            )
+        })
+    }
 }
 
 /// Connect with a candidate admin DSN (short timeout, single connection) and
@@ -188,20 +253,27 @@ pub async fn check_admin_role(dsn: &str) -> anyhow::Result<RoleCheck> {
         .acquire_timeout(std::time::Duration::from_secs(4))
         .connect(dsn)
         .await?;
-    let row: (String, bool, bool, bool, String) = sqlx::query_as(
-        "SELECT current_user::text, rolsuper, rolcreatedb, rolcreaterole, \
-                current_setting('server_version') \
-         FROM pg_roles WHERE rolname = current_user",
+    let row: (String, String, bool, bool, bool, String, i32) = sqlx::query_as(
+        "SELECT c.rolname::text, s.rolname::text, \
+                s.rolsuper OR c.rolsuper OR EXISTS ( \
+                    SELECT 1 FROM pg_roles su \
+                    WHERE su.rolsuper AND pg_has_role(s.oid, su.oid, 'MEMBER')), \
+                c.rolcreatedb, c.rolcreaterole, \
+                current_setting('server_version'), current_setting('server_version_num')::int \
+         FROM pg_roles s, pg_roles c \
+         WHERE s.rolname = session_user AND c.rolname = current_user",
     )
     .fetch_one(&pool)
     .await?;
     pool.close().await;
     Ok(RoleCheck {
         role: row.0,
-        is_superuser: row.1,
-        can_createdb: row.2,
-        can_createrole: row.3,
-        server_version: row.4,
+        login: row.1,
+        is_superuser: row.2,
+        can_createdb: row.3,
+        can_createrole: row.4,
+        server_version: row.5,
+        server_version_num: row.6,
     })
 }
 
@@ -285,6 +357,92 @@ pub fn valid_cidr(s: &str) -> bool {
             }
         }
     }
+}
+
+/// The widest range a tenant may allow at the edge by themselves (CRYPTARCH-142;
+/// Antun, 2026-10-06). Wider is an admin's call — or an admin's named source /
+/// server default, which IS that call, made in advance for exactly that range.
+pub const TENANT_WIDEST_V4: u8 = 16;
+pub const TENANT_WIDEST_V6: u8 = 48;
+
+/// A valid IP or CIDR as (network, prefix), IPv4-mapped IPv6 ranges judged as
+/// the IPv4 range they carry (`::ffff:10.0.0.0/104` is `10.0.0.0/8`), so the
+/// limit cannot be stepped around by spelling a range in the other family.
+fn net(s: &str) -> Option<(std::net::IpAddr, u8)> {
+    use std::net::IpAddr;
+    if !valid_cidr(s) {
+        return None;
+    }
+    let (ip, n) = match s.split_once('/') {
+        Some((ip, n)) => (ip.parse::<IpAddr>().ok()?, n.parse::<u8>().ok()?),
+        None => {
+            let ip = s.parse::<IpAddr>().ok()?;
+            (ip, if ip.is_ipv4() { 32 } else { 128 })
+        }
+    };
+    Some(match ip {
+        IpAddr::V6(v6) if n >= 96 => match v6.to_ipv4_mapped() {
+            Some(v4) => (IpAddr::V4(v4), n - 96),
+            None => (ip, n),
+        },
+        _ => (ip, n),
+    })
+}
+
+/// Whether a range reaches 0.0.0.0 / :: — "everything", never a tenant's at
+/// any width: IPv4 0.0.0.0/8 and anything containing it, IPv6 ::/n, and an
+/// IPv6 range that contains the whole IPv4-mapped block.
+fn reaches_everything(ip: std::net::IpAddr, n: u8) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets()[0] == 0,
+        std::net::IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let mapped = u128::from(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0));
+            let mask = if n == 0 { 0 } else { u128::MAX << (128 - n) };
+            bits == 0 || (n <= 96 && mapped & mask == bits)
+        }
+    }
+}
+
+/// Whether a NON-admin may allow `cidr`: /16 (IPv6 /48) or narrower, or exactly
+/// one of `approved` (the server's admin-configured ranges), and in either case
+/// never a range reaching 0.0.0.0. Admins are not asked. False for anything
+/// that is not a valid range.
+pub fn tenant_may_allow(cidr: &str, approved: &[String]) -> bool {
+    let Some((ip, n)) = net(cidr) else { return false };
+    if reaches_everything(ip, n) {
+        return false;
+    }
+    let narrow = match ip {
+        std::net::IpAddr::V4(_) => n >= TENANT_WIDEST_V4,
+        std::net::IpAddr::V6(_) => n >= TENANT_WIDEST_V6,
+    };
+    narrow || approved.iter().any(|a| net(a) == Some((ip, n)))
+}
+
+/// The ranges an admin has configured for `server_id` — its named sources and
+/// its default consumer CIDR — which a tenant may allow whatever their width.
+pub async fn approved_ranges(db: &sqlx::PgPool, server_id: Uuid) -> Vec<String> {
+    let mut out: Vec<String> = sources_for(db, server_id).await.into_iter().map(|s| s.cidr).collect();
+    let default: Option<String> = sqlx::query_scalar(
+        "SELECT default_consumer_cidr::text FROM managed_servers WHERE id = $1",
+    )
+    .bind(server_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    out.extend(default);
+    out
+}
+
+/// The refusal both doors show for a range [`tenant_may_allow`] rejects.
+pub fn range_too_broad_message(cidr: &str) -> String {
+    format!(
+        "Only an admin can allow '{cidr}': ranges wider than /{TENANT_WIDEST_V4} \
+         (IPv6 /{TENANT_WIDEST_V6}), or reaching 0.0.0.0, are admin-only unless an admin \
+         has named that range for this server. Use a narrower range, or ask an admin."
+    )
 }
 
 /// Listener-host validation: an IP (v4/v6) or an FQDN. Dial targets only —
@@ -449,6 +607,56 @@ pub async fn resolve_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRYPTARCH-142 (Antun, 2026-10-06): tenants allow /16 (IPv6 /48) or
+    /// narrower by themselves; wider is admin-only unless an admin named that
+    /// exact range for the server; anything reaching 0.0.0.0 never is.
+    #[test]
+    fn tenant_range_limits() {
+        let none: &[String] = &[];
+        for ok in ["10.1.0.0/16", "10.10.100.0/24", "203.0.113.7", "203.0.113.7/32",
+                   "2001:db8:1::/48", "2001:db8::1", "::ffff:10.1.0.0/112", "::1"] {
+            assert!(tenant_may_allow(ok, none), "{ok} should be a tenant's to allow");
+        }
+        for broad in ["10.0.0.0/15", "10.0.0.0/8", "128.0.0.0/1", "0.0.0.0/0",
+                      "2001:db8::/47", "::/0", "::ffff:10.0.0.0/104"] {
+            assert!(!tenant_may_allow(broad, none), "{broad} is wider than a tenant may allow");
+        }
+        // Reaching 0.0.0.0 is never a tenant's, at any width, approved or not.
+        let zeros = ["0.0.0.0", "0.0.0.0/16", "0.1.0.0/16", "::", "::/64",
+                     "::ffff:0.0.0.0/96", "::ffff:0.0.0.0/120", "::fffe:0:0/95"];
+        let approved: Vec<String> = zeros.iter().map(|z| z.to_string()).collect();
+        for z in zeros {
+            assert!(!tenant_may_allow(z, &approved), "{z} reaches everything");
+        }
+        // An admin-named range is approval for exactly that range.
+        let named = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+        assert!(tenant_may_allow("10.0.0.0/8", &named));
+        assert!(tenant_may_allow("2001:db8::/32", &named));
+        assert!(!tenant_may_allow("10.0.0.0/7", &named), "approval is for the named range, not wider");
+        assert!(!tenant_may_allow("0.0.0.0/0", &["0.0.0.0/0".to_string()]));
+        // Garbage is never allowed (callers validate first; this must not be the gap).
+        assert!(!tenant_may_allow("not-an-ip", none));
+    }
+
+    fn check_at(num: i32, text: &str) -> RoleCheck {
+        RoleCheck {
+            role: "cryptarch_admin".into(),
+            login: "cryptarch_admin".into(),
+            is_superuser: false,
+            can_createdb: true,
+            can_createrole: true,
+            server_version: text.into(),
+            server_version_num: num,
+        }
+    }
+
+    #[test]
+    fn servers_older_than_14_are_refused_and_14_is_not() {
+        assert!(check_at(130_016, "13.16").version_refusal().is_some(), "13 must be refused");
+        assert!(check_at(MIN_SERVER_VERSION_NUM, "14.0").version_refusal().is_none(), "14.0 is the floor");
+        assert!(check_at(180_006, "18.6").version_refusal().is_none());
+    }
 
     #[test]
     fn cidr_accepts_sane_inputs() {

@@ -68,6 +68,9 @@ auth_type = hba
 auth_hba_file = /etc/pgbouncer/pgbouncer_hba.conf
 auth_file = /etc/pgbouncer/userlist.txt
 admin_users = pgbadmin
+# Mirrors the compose stack: the renderer emits a console hba line per console
+# user, so pgbstats has to exist here too or the rendered rule names nobody.
+stats_users = pgbstats
 ; dynamic consumer auth: bouncer resolves provisioned users from Postgres
 ; itself via the cryptarch.get_auth shim (installed by server-init).
 auth_user = cryptarch_auth
@@ -100,6 +103,7 @@ EOF
 # so consumer passwords never live in this file at all.
 cat > "$CONF_DIR/userlist.txt" <<EOF
 "pgbadmin" "devconsole"
+"pgbstats" "devstats"
 "postgres" "devpass"
 EOF
 
@@ -167,6 +171,14 @@ export CRYPTARCH_SEED_SERVER_PORT="$BOUNCER_PORT"
 # mirroring the compose stack's out-of-box behavior.
 DEV_SUBNET=$(docker network inspect "$NET" -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)
 export CRYPTARCH_SEED_SERVER_DEFAULT_CIDR="${DEV_SUBNET}"
+# Who may reach the bouncer console (CRYPTARCH-104). REQUIRED here, not
+# optional: the dev app runs on the HOST and reaches the bouncer through a
+# published port, so the bouncer sees the bridge GATEWAY address (172.x.0.1),
+# not 127.0.0.1. Leaving the default would let the first edge sync write an hba
+# that locks Cryptarch out of its own console — the sync itself succeeds (the
+# old hba is still live when it RELOADs) and every console operation after it
+# fails, leaving the server permanently edge_dirty.
+export CRYPTARCH_CONSOLE_CIDR="${DEV_SUBNET}"
 # In-stack dial path: the bouncer's container name on the dev network.
 export CRYPTARCH_SEED_SERVER_STACK_LISTENER="$BOUNCER_NAME:6432"
 
@@ -174,4 +186,9 @@ echo ">> admin login:   admin / $ADMIN_PW"
 echo ">> app:           http://<this-host>:$APP_PORT/"
 echo ">> bouncer:       127.0.0.1:$BOUNCER_PORT (console: pgbadmin/devconsole db=pgbouncer)"
 echo ">> teardown:      docker rm -f $PG_NAME $BOUNCER_NAME && docker network rm $NET"
+# The UI is compiled into the binary, so build it first; SKIP_FRONTEND=1 keeps
+# whatever frontend/build already holds (or build.rs's placeholder).
+if [ -z "${SKIP_FRONTEND:-}" ]; then
+  (cd frontend && { [ -d node_modules ] || npm ci; } && npm run build)
+fi
 exec cargo run --release

@@ -1,0 +1,12 @@
+-- CRYPTARCH-66: every job narrates itself.
+--
+-- Until now a finished backup said only 'ok' or 'failed' plus a one-line error,
+-- and pg_dump's stderr was captured ONLY on failure — a dump that succeeded
+-- while emitting warnings threw them away. The log is appended to as the job
+-- runs rather than written at the end, so a job in flight can be read while it
+-- is still working.
+--
+-- Deliberately a column and not a separate events table: a job log is always
+-- read whole, always in the context of exactly one row, and it needs to ride
+-- the metadata backup with that row. The application caps its length.
+ALTER TABLE backups ADD COLUMN IF NOT EXISTS log TEXT NOT NULL DEFAULT '';

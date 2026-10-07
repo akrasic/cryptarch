@@ -9,6 +9,7 @@
 
 use anyhow::{bail, Context};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use uuid::Uuid;
 
 use crate::crypto::Crypto;
@@ -24,7 +25,13 @@ pub fn bootstrap_sql(panel_role: &str) -> String {
         "-- Cryptarch server bootstrap: run ONCE as a superuser on the managed server.\n\
          -- (The panel role itself is intentionally not superuser. PostgreSQL 16+.)\n\
          GRANT SELECT ON pg_shadow TO {quoted};\n\
-         CREATE SCHEMA IF NOT EXISTS cryptarch AUTHORIZATION {quoted};"
+         CREATE SCHEMA IF NOT EXISTS cryptarch AUTHORIZATION {quoted};\n\
+         -- Read-only visibility of other sessions, for the maintenance report\n\
+         -- (CRYPTARCH-97). Without it pg_stat_activity shows the panel only its\n\
+         -- own connections, so a tenant holding a transaction open — which blocks\n\
+         -- cleanup server-wide — would be invisible and reported as healthy.\n\
+         -- Grants no ability to read or change any data.\n\
+         GRANT pg_read_all_stats TO {quoted};"
     )
 }
 
@@ -147,19 +154,24 @@ pub async fn run_init(
             .await?;
     }
     // Plaintext never travels in DDL — the managed server's statement logs
-    // would otherwise capture it. Send the SCRAM verifier instead.
-    let verifier = postgres_protocol::password::scram_sha_256(auth_pw.as_bytes());
+    // would otherwise capture it. Send the SCRAM verifier instead, quoted:
+    // SCRAM output cannot contain a single quote, but that is a fact about
+    // another crate's output format, and an enforced guard beats a remembered
+    // one. Same treatment as create_user_db.
+    let verifier = crate::engine::postgres::PostgresEngine::quote_literal(
+        &postgres_protocol::password::scram_sha_256(auth_pw.as_bytes()),
+    );
     let role_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)")
             .bind(AUTH_ROLE)
             .fetch_one(&pool)
             .await?;
     let role_res = if role_exists {
-        sqlx::query(&format!("ALTER ROLE {AUTH_ROLE} LOGIN PASSWORD '{verifier}'"))
+        sqlx::query(AssertSqlSafe(format!("ALTER ROLE {AUTH_ROLE} LOGIN PASSWORD {verifier}")))
             .execute(&pool)
             .await
     } else {
-        sqlx::query(&format!("CREATE ROLE {AUTH_ROLE} LOGIN PASSWORD '{verifier}'"))
+        sqlx::query(AssertSqlSafe(format!("CREATE ROLE {AUTH_ROLE} LOGIN PASSWORD {verifier}")))
             .execute(&pool)
             .await
     };
@@ -180,9 +192,9 @@ pub async fn run_init(
     // PG16: creating a role grants the creator ADMIN OPTION but not SET —
     // the verification step below needs SET ROLE, so self-grant it (allowed
     // via ADMIN OPTION). INHERIT FALSE: no passive privilege accumulation.
-    if let Err(e) = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(AssertSqlSafe(format!(
         "GRANT {AUTH_ROLE} TO CURRENT_USER WITH INHERIT FALSE, SET TRUE"
-    ))
+    )))
     .execute(&pool)
     .await
     {
@@ -199,19 +211,20 @@ pub async fn run_init(
          RETURNS TABLE(usename TEXT, passwd TEXT) \
          LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS \
          'SELECT usename::text, passwd::text FROM pg_shadow \
-          WHERE usename = uname AND NOT usesuper'"
-        .to_string();
+          WHERE usename = uname AND NOT usesuper'";
     let grants = [
         "REVOKE ALL ON FUNCTION cryptarch.get_auth(TEXT) FROM PUBLIC".to_string(),
         format!("GRANT EXECUTE ON FUNCTION cryptarch.get_auth(TEXT) TO {AUTH_ROLE}"),
         format!("GRANT USAGE ON SCHEMA cryptarch TO {AUTH_ROLE}"),
     ];
-    if let Err(e) = sqlx::query(&shim).execute(&pool).await {
+    if let Err(e) = sqlx::query(shim).execute(&pool).await {
         steps.push(fail("auth_query shim", e.to_string()));
         return finish(db, server_id, steps, "failed", None, Some(panel_role)).await;
     }
     for g in &grants {
-        if let Err(e) = sqlx::query(g).execute(&pool).await {
+        // Const-derived: two fixed literals plus AUTH_ROLE, which is a const in
+        // this file. No runtime value reaches the SQL text.
+        if let Err(e) = sqlx::query(AssertSqlSafe(g.as_str())).execute(&pool).await {
             steps.push(fail("auth_query shim grants", e.to_string()));
             return finish(db, server_id, steps, "failed", None, Some(panel_role)).await;
         }
@@ -223,13 +236,25 @@ pub async fn run_init(
     // exists and we just set its SCRAM verifier.
     let verify = async {
         let mut conn = pool.acquire().await?;
-        sqlx::query(&format!("SET ROLE {AUTH_ROLE}")).execute(&mut *conn).await?;
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM cryptarch.get_auth($1)")
+        sqlx::query(AssertSqlSafe(format!("SET ROLE {AUTH_ROLE}"))).execute(&mut *conn).await?;
+        // Capture, RESET unconditionally, THEN propagate — the same shape
+        // `drop_user_db` uses, and for the same reason. A `?` on the probe
+        // would return before the reset and drop this connection back into the
+        // MANAGED SERVER'S ADMIN POOL still set to the auth role: a role with
+        // LOGIN and EXECUTE on one shim function and nothing else. Later admin
+        // work on that server would then fail intermittently, depending on
+        // which pooled connection it drew, with the symptom in a different
+        // feature from the cause.
+        //
+        // Note the failure path this protects is *shim verification failing*,
+        // which is exactly the state an operator is in when they retry a
+        // bootstrap — so the leaked connection and the retry arrive together.
+        let probe = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cryptarch.get_auth($1)")
             .bind(AUTH_ROLE)
             .fetch_one(&mut *conn)
-            .await?;
-        sqlx::query("RESET ROLE").execute(&mut *conn).await?;
-        anyhow::Ok(n)
+            .await;
+        let _ = sqlx::query("RESET ROLE").execute(&mut *conn).await;
+        anyhow::Ok(probe?)
     };
     match verify.await {
         Ok(n) if n > 0 => steps.push(ok("Shim verification", "auth role can resolve credentials")),
@@ -441,54 +466,76 @@ fn ensure_include(dir: &std::path::Path) -> anyhow::Result<&'static str> {
 /// mid-write must never truncate the live file (a half-written userlist
 /// would lock out the very console RELOAD needs).
 pub(crate) fn atomic_write(path: &std::path::Path, content: &str, mode: u32) -> anyhow::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().context("path has no parent")?;
-    // Unique tmp per write: concurrent writers must not share a tmp path
-    // (interleaved write + double rename = lost update or ENOENT).
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("cryptarch"),
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed),
-    ));
-    std::fs::write(&tmp, content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-    }
-    let _ = mode; // non-unix: default perms
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    atomic_write_mode(path, content, |_| mode).map(|_| ())
 }
 
-/// Write a secret-bearing file: try 0640, fall back to 0644 with a warning.
-/// Returns the mode actually used.
+/// `atomic_write`, with the mode chosen from the uid that owns the new file.
+/// Answers the mode used.
+///
+/// NOTHING HERE FOLLOWS A LINK (S8c audit). The conf dir is shared with the
+/// bouncer, and anything that can write there could plant a symlink at the
+/// temp name — which was predictable (pid and a counter) — and have this
+/// overwrite, then chmod 0644, any file the app can write: the master key
+/// included. So the temp name is random, it is created exclusively
+/// (`create_new` is O_CREAT|O_EXCL, which refuses an existing name, a symlink
+/// included), and its mode is set on the open handle, never by path. The
+/// rename replaces the directory entry; it does not follow a link at the
+/// destination.
+pub(crate) fn atomic_write_mode(
+    path: &std::path::Path,
+    content: &str,
+    mode: impl FnOnce(u32) -> u32,
+) -> anyhow::Result<u32> {
+    use std::io::Write;
+    let dir = path.parent().context("path has no parent")?;
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("cryptarch"),
+        Uuid::new_v4().simple(),
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    #[cfg(unix)]
+    let chosen = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let chosen = mode(file.metadata()?.uid());
+        file.set_permissions(std::fs::Permissions::from_mode(chosen))?;
+        chosen
+    };
+    #[cfg(not(unix))]
+    let chosen = mode(0);
+    let written = file.write_all(content.as_bytes()).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(chosen)
+}
+
+/// Write a secret-bearing file: 0640, or 0644 with a warning when running
+/// unprivileged. The choice is made before the file exists under its name, so
+/// no chmod ever runs on a path someone else could have swapped.
 fn write_secret(path: &std::path::Path, content: &str) -> anyhow::Result<u32> {
-    atomic_write(path, content, 0o640)?;
     // If the bouncer can't read 0640 (different uid/gid arrangement), the
     // operator will see auth failures immediately; dev harness needs 0644
     // because the container reads as uid 70 with no shared group.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let uid = std::fs::metadata(path)?.uid();
-        // Heuristic: when we're not root (dev on host), uid-70 bouncer can't
-        // group-read our 0640 file — relax to 0644 and say so.
-        if uid != 0 {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
-            tracing::warn!(
-                "{} written 0644 (world-readable): running unprivileged, container \
-                 bouncer reads as uid 70. In production run the app as root in its \
-                 container or arrange a shared group for 0640.",
-                path.display()
-            );
-            return Ok(0o644);
-        }
+    let mode = atomic_write_mode(path, content, |uid| if uid != 0 { 0o644 } else { 0o640 })?;
+    if mode == 0o644 {
+        tracing::warn!(
+            "{} written 0644 (world-readable): running unprivileged, container \
+             bouncer reads as uid 70. In production run the app as root in its \
+             container or arrange a shared group for 0640.",
+            path.display()
+        );
     }
-    Ok(0o640)
+    Ok(mode)
 }
 
 /// Run one command on the PgBouncer admin console (simple query protocol),
@@ -541,6 +588,34 @@ pub async fn console_command(console_dsn: &str, cmd: &str) -> anyhow::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_never_follows_a_planted_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cryptarch-aw-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("master.key");
+        std::fs::write(&secret, "SECRET").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Links at every name the old scheme could have used, and at the
+        // destination itself.
+        for seq in 0..4 {
+            let planted = dir.join(format!(".pgbouncer_hba.conf.{}.{seq}.tmp", std::process::id()));
+            std::os::unix::fs::symlink(&secret, planted).unwrap();
+        }
+        let target = dir.join("pgbouncer_hba.conf");
+        std::os::unix::fs::symlink(&secret, &target).unwrap();
+
+        atomic_write(&target, "host all all 10.0.0.0/8 trust\n", 0o644).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "SECRET", "the link's target was overwritten");
+        assert_eq!(std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777, 0o600, "or re-moded");
+        assert!(!std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink(), "the link itself is replaced");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "host all all 10.0.0.0/8 trust\n");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn temp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("cryptarch_edge_{}", uuid::Uuid::new_v4().simple()));

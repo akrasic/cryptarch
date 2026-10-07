@@ -1,0 +1,12 @@
+-- CRYPTARCH-67: what each backup actually contains.
+--
+-- DISPLAY COPY ONLY. The authoritative manifest lives inside the blob's
+-- authenticated header, where it cannot be edited without the key and cannot be
+-- separated from the data it describes. This column exists so the portal can
+-- show a backup's contents without decrypting it, and must never be the source
+-- for a safety decision: anyone who can write this table could otherwise forge
+-- a reassuring "no hazards" that an operator reads while deciding to restore.
+--
+-- NULL means no manifest was recorded, which the reader reports as UNKNOWN —
+-- never as "no hazards found".
+ALTER TABLE backups ADD COLUMN IF NOT EXISTS manifest JSONB;

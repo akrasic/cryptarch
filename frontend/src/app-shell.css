@@ -1,0 +1,23 @@
+/* The mount point SvelteKit renders into should not produce a box of its own.
+   It was an inline style attribute, which the CSP (style-src 'self') blocks. */
+.sk-root {
+	display: contents;
+}
+
+/* SvelteKit's route announcer: a live region that reads the new page title to
+   screen readers after a client-side navigation. SvelteKit hides it with an
+   inline style attribute, which the CSP (style-src 'self') correctly blocks —
+   so the same visually-hidden rules come from this stylesheet instead, and the
+   blocked attribute changes nothing. Allowing it would need 'unsafe-hashes'
+   keyed to a SvelteKit-internal string. */
+#svelte-announcer {
+	position: absolute;
+	left: 0;
+	top: 0;
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	overflow: hidden;
+	white-space: nowrap;
+	width: 1px;
+	height: 1px;
+}

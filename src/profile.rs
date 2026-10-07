@@ -4,26 +4,13 @@
 //! the current password even with a live session (a walked-up-to-an-open-
 //! laptop attacker must not be able to rotate the password quietly).
 
-use axum::extract::State;
-use axum::response::{IntoResponse, Response};
-use axum::Form;
-use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use maud::html;
 use serde::Deserialize;
 
-use crate::auth::{self, CurrentUser, SESSION_COOKIE};
+use crate::auth::{self};
 use crate::provision::audit;
-use crate::web::{shell, AppState};
+use crate::web::AppState;
 
-const MIN_PASSWORD_LEN: usize = 8;
-
-pub async fn page(
-    State(state): State<AppState>,
-    CurrentUser(session): CurrentUser,
-    jar: CookieJar,
-) -> Response {
-    render(&state, &session, &jar, None, None).await
-}
+pub const MIN_PASSWORD_LEN: usize = 8;
 
 #[derive(Deserialize)]
 pub struct PasswordInput {
@@ -32,165 +19,133 @@ pub struct PasswordInput {
     confirm_password: String,
 }
 
-pub async fn change_password(
-    State(state): State<AppState>,
-    CurrentUser(session): CurrentUser,
-    jar: CookieJar,
-    Form(input): Form<PasswordInput>,
-) -> Response {
-    if input.new_password != input.confirm_password {
-        return render(&state, &session, &jar, Some("New passwords don't match."), None).await;
-    }
-    if input.new_password.len() < MIN_PASSWORD_LEN {
-        return render(&state, &session, &jar,
-            Some("New password must be at least 8 characters."), None).await;
-    }
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
-            .bind(session.user_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten();
-    let Some(stored) = stored else {
-        return crate::web::error_page(&session, axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Something went wrong", "Loading your account failed — your password was not changed.");
-    };
-    if !auth::verify_password(&input.current_password, &stored) {
-        // Failed attempts are audit-worthy: a stolen-cookie attacker gets
-        // Argon2-speed guesses here, and silence would hide the probing.
-        audit(&state.db, &session.username, "change_password_failed",
-              Some(&session.username), None)
-            .await;
-        return render(&state, &session, &jar, Some("Current password is wrong."), None).await;
-    }
-    let new_hash = match auth::hash_password(&input.new_password) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!("hashing new password for {}: {e}", session.username);
-            return crate::web::error_page(&session, axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Something went wrong", "Hashing the new password failed — your password was not changed.");
-        }
-    };
-    if let Err(e) = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-        .bind(&new_hash)
-        .bind(session.user_id)
-        .execute(&state.db)
-        .await
-    {
-        tracing::error!("updating password for {}: {e}", session.username);
-        return crate::web::error_page(&session, axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Something went wrong", "Saving the new password failed — your old password still works.");
-    }
-
-    // A password change revokes every OTHER session AND rotates the current
-    // token — a cookie stolen before the change must not survive it.
-    let revoked = match jar.get(SESSION_COOKIE) {
-        Some(c) => {
-            let n = state.sessions.remove_others(session.user_id, c.value()).await;
-            state.sessions.remove(c.value()).await;
-            n
-        }
-        None => 0,
-    };
-    let new_token = match state.sessions.insert(session.user_id).await {
-        Ok(t) => t,
-        Err(e) => {
-            // Password IS changed; the user just needs to log in again.
-            tracing::error!("rotating session after password change: {e}");
-            return axum::response::Redirect::to("/login").into_response();
-        }
-    };
-    let jar = jar.add(
-        Cookie::build((SESSION_COOKIE, new_token))
-            .path("/")
-            .http_only(true)
-            .secure(state.secure_cookies)
-            .same_site(SameSite::Lax)
-            .build(),
-    );
-    audit(&state.db, &session.username, "change_password", Some(&session.username),
-          Some(&format!("other_sessions_revoked={revoked}, current rotated")))
-        .await;
-    let page = render(&state, &session, &jar, None,
-           Some("Password changed. All other sessions were signed out.")).await;
-    (jar, page).into_response()
+/// Why a password change was refused. Nothing changed in any of them.
+#[derive(Debug)]
+pub enum PasswordError {
+    Mismatch,
+    TooShort,
+    TooLong,
+    /// The current password was wrong. Audited: a stolen-cookie attacker gets
+    /// Argon2-speed guesses here, and silence would hide the probing.
+    WrongCurrent,
+    /// Too many wrong guesses for this account — counted with login's, so
+    /// neither door is a way around the other (S5 audit P2).
+    Throttled,
+    /// The password, the account or this session changed while the request
+    /// was being checked — an admin reset, a suspension. Nothing changed here.
+    ChangedElsewhere,
+    Internal,
 }
 
-pub async fn revoke_others(
-    State(state): State<AppState>,
-    CurrentUser(session): CurrentUser,
-    jar: CookieJar,
-) -> Response {
-    let revoked = match jar.get(SESSION_COOKIE) {
-        Some(c) => state.sessions.remove_others(session.user_id, c.value()).await,
-        None => 0,
-    };
-    audit(&state.db, &session.username, "revoke_sessions", Some(&session.username),
-          Some(&format!("revoked={revoked}")))
-        .await;
-    render(&state, &session, &jar, None,
-           Some(&format!("Signed out {revoked} other session(s)."))).await
+impl std::fmt::Display for PasswordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PasswordError::Mismatch => "New passwords don't match.",
+            PasswordError::TooShort => "New password must be at least 8 characters.",
+            PasswordError::TooLong => "New password is too long.",
+            PasswordError::WrongCurrent => "Current password is wrong.",
+            PasswordError::Throttled => "Too many failed attempts — wait a few minutes and try again.",
+            PasswordError::ChangedElsewhere => {
+                "Your password or this session changed while this was being checked — nothing was \
+                 changed here. Sign in again."
+            }
+            PasswordError::Internal => "Something went wrong — your password was not changed.",
+        })
+    }
 }
 
-async fn render(
+/// What a change did.
+pub struct PasswordChanged {
+    /// The acting session's new token; every old one, its own included, is gone.
+    pub token: String,
+    pub other_sessions_signed_out: u64,
+}
+
+/// Change the signed-in user's own password.
+/// The current password is demanded even with a live session (a walked-up-to
+/// open laptop must not rotate it quietly), and the change is whole or not at
+/// all — see `SessionStore::change_password_rotating`.
+pub async fn change_password_for(
     state: &AppState,
     session: &crate::auth::Session,
-    jar: &CookieJar,
-    error: Option<&str>,
-    notice: Option<&str>,
-) -> Response {
-    let sessions = match jar.get(SESSION_COOKIE) {
-        Some(c) => state.sessions.list_for_user(session.user_id, c.value()).await,
-        None => Vec::new(),
+    current_token: &str,
+    input: PasswordInput,
+) -> Result<PasswordChanged, PasswordError> {
+    if input.new_password != input.confirm_password {
+        return Err(PasswordError::Mismatch);
+    }
+    if input.new_password.len() < MIN_PASSWORD_LEN {
+        return Err(PasswordError::TooShort);
+    }
+    // A validation message, not the internal error the hasher's own refusal
+    // would surface as (CRYPTARCH-128).
+    if input.new_password.len() > auth::MAX_PASSWORD_LEN {
+        return Err(PasswordError::TooLong);
+    }
+    let stored: Option<String> = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(session.user_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let Some(stored) = stored else { return Err(PasswordError::Internal) };
+    // The login throttle, keyed the same way: a guess here and a guess at the
+    // login form spend one budget.
+    let Some(_attempt) = state.login_throttle.begin(&session.username) else {
+        return Err(PasswordError::Throttled);
     };
-    shell(
-        "Profile",
-        session,
-        html! {
-            h1 { "Profile" }
-            @if let Some(msg) = error { p.error role="alert" { (msg) } }
-            @if let Some(msg) = notice { p.notice role="status" { (msg) } }
-            dl.creds {
-                dt { "Username" } dd { code { (session.username) } }
-                dt { "Role" } dd { @if session.is_admin { "admin" } @else { "user" } }
+    // On the blocking pool for the reason given at the login site
+    // (CRYPTARCH-115): this path hands a stolen-cookie attacker Argon2-speed
+    // guesses, so it is a second place an attacker chooses how much CPU to spend.
+    if !auth::verify_account_password(input.current_password, stored.clone()).await {
+        state.login_throttle.record_failure(&session.username);
+        audit(&state.db, &session.actor(), "change_password_failed", Some(&session.username), None).await;
+        return Err(PasswordError::WrongCurrent);
+    }
+    state.login_throttle.clear(&session.username);
+    let new_hash = auth::hash_password_capped(input.new_password).await.map_err(|e| {
+        tracing::error!("hashing new password for {}: {e}", session.username);
+        PasswordError::Internal
+    })?;
+    // The rotated session keeps this one's lineage: whoever set the password
+    // it signed in with may be who just changed it (CRYPTARCH-146).
+    let (token, other_sessions_signed_out) = state
+        .sessions
+        .change_password_rotating(
+            session.user_id,
+            &stored,
+            &new_hash,
+            current_token,
+            session.began_on_password_set_by.as_deref(),
+        )
+        .await
+        .map_err(|e| match e {
+            auth::RotateError::Stale => PasswordError::ChangedElsewhere,
+            auth::RotateError::Db(e) => {
+                tracing::error!("changing password for {}: {e}", session.username);
+                PasswordError::Internal
             }
-            h2 { "Change password" }
-            form method="post" action="/profile/password" .scard {
-                (crate::web::srow("Current password",
-                    "Required even while signed in — proof it's really you at the keyboard.",
-                    html! { input type="password" name="current_password" autocomplete="current-password" required; }))
-                (crate::web::srow("New password",
-                    "At least 8 characters.",
-                    html! { input type="password" name="new_password" autocomplete="new-password" required; }))
-                (crate::web::srow("Confirm new password",
-                    "Typed twice so a typo can't lock you out.",
-                    html! { input type="password" name="confirm_password" autocomplete="new-password" required; }))
-                (crate::web::sfoot(Some("Signs out every other session automatically."), "Change password"))
-            }
-            h2 { "Active sessions" }
-            div.table-scroll {
-                table.dbs {
-                    thead { tr { th { "Started" } th { "Last seen" } th { "" } } }
-                    tbody {
-                        @for s in &sessions {
-                            tr {
-                                td.tnum { (s.created_at.format("%Y-%m-%d %H:%M UTC").to_string()) }
-                                td.tnum { (s.last_seen.format("%Y-%m-%d %H:%M UTC").to_string()) }
-                                td { @if s.is_current { span.st.st-active { span.dot {} "this session" } } }
-                            }
-                        }
-                    }
-                }
-            }
-            @if sessions.len() > 1 {
-                form method="post" action="/profile/sessions/revoke-others" .inline {
-                    button type="submit" { "Sign out everywhere else" }
-                }
-            }
-        },
-    )
-    .into_response()
+        })?;
+    audit(&state.db, &session.actor(), "change_password", Some(&session.username),
+          Some(&format!("other_sessions_revoked={other_sessions_signed_out}, current rotated")))
+        .await;
+    Ok(PasswordChanged { token, other_sessions_signed_out })
+}
+
+/// "Sign out everywhere else". `Err` when the revocation failed — never a
+/// count of zero that reads like "there were none".
+pub async fn revoke_others_for(
+    state: &AppState,
+    session: &crate::auth::Session,
+    current_token: &str,
+) -> Result<u64, ()> {
+    let revoked = state.sessions.remove_others_checked(session.user_id, current_token).await.map_err(|e| {
+        tracing::error!("revoking other sessions for {}: {e}", session.username);
+    })?;
+    audit(&state.db, &session.actor(), "revoke_sessions", Some(&session.username),
+          Some(&format!("revoked={revoked}")))
+        .await;
+    Ok(revoked)
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 //! An in-process loop — no cron, no sidecar — probes every active server on
 //! an interval: the edge listener (TCP to the advertised address, i.e. what
 //! users actually dial), Postgres (DbEngine::ping over the admin connection),
-//! and config drift (the same checksum checks the server page runs on view,
+//! and config drift (the same checksum checks the Edge health page runs on view,
 //! but on a schedule, so drift is noticed before an admin happens to look).
 //!
 //! Alerting is TRANSITION-based: a check going red fires one notification,
@@ -124,13 +124,13 @@ pub async fn check_server(
 }
 
 /// The on-disk render vs desired state, condensed to one verdict. Mirrors
-/// the richer per-file panel on the server page; this one only answers
+/// the richer per-file panel on the Edge health page; this one only answers
 /// "does anything need attention".
 async fn check_drift(state: &AppState, id: Uuid, dir: &str, tls_mode: &str) -> CheckResult {
     let dir = std::path::Path::new(dir);
 
     let desired_hba = match crate::acl::load_rules(&state.db, id).await {
-        Ok(rules) => crate::acl::render_hba(&rules, tls_mode),
+        Ok(rules) => crate::acl::render_hba(&rules, tls_mode, crate::acl::console_cidr()),
         Err(e) => return Err(format!("loading ACL state: {e}")),
     };
     match std::fs::read_to_string(dir.join("pgbouncer_hba.conf")) {
@@ -245,6 +245,15 @@ impl Notifier {
 
 /// Human message, shared by both formats and the audit log.
 pub fn message(t: &Transition) -> String {
+    // Backups are about a database, not a server, and "DOWN"/"recovered" reads
+    // wrong for them — the incident is that data is unprotected.
+    if t.check == "backup" {
+        return if t.failed {
+            format!("{}: BACKUP AT RISK — {}", t.server, t.detail)
+        } else {
+            format!("{}: backups healthy again", t.server)
+        };
+    }
     let what = match t.check {
         "edge" => "edge listener",
         "postgres" => "postgres",

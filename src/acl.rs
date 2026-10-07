@@ -8,6 +8,7 @@
 //! is structural: PgBouncer rejects whatever no hba line admits.
 
 use sha2::{Digest, Sha256};
+use sqlx::AssertSqlSafe;
 use uuid::Uuid;
 
 use crate::crypto::Crypto;
@@ -25,7 +26,7 @@ pub struct AclRule {
 /// Layout: checksum header (drift detection), console line, one line per
 /// rule ordered (db, cidr). `hostssl` when the server terminates TLS at the
 /// edge, plain `host` otherwise.
-pub fn render_hba(rules: &[AclRule], tls_mode: &str) -> String {
+pub fn render_hba(rules: &[AclRule], tls_mode: &str, console_cidr: &str) -> String {
     // Exhaustive on purpose: a future third mode must not silently fail
     // open toward no-TLS.
     let conn_type = match tls_mode {
@@ -40,7 +41,42 @@ pub fn render_hba(rules: &[AclRule], tls_mode: &str) -> String {
     sorted.sort_by(|a, b| (&a.db_name, &a.cidr).cmp(&(&b.db_name, &b.cidr)));
 
     let mut body = String::new();
-    body.push_str("host pgbouncer pgbadmin 0.0.0.0/0 scram-sha-256\n");
+    // The console, reachable only from where Cryptarch and the exporter live
+    // (CRYPTARCH-104).
+    //
+    // This was `0.0.0.0/0`, re-emitted on EVERY render — so Cryptarch taking
+    // ownership of the hba file did not narrow the seed's rule, it reinstated
+    // it. The bouncer sits on the `db` network, which is attachable and is the
+    // documented way tenant containers connect, so every tenant app could
+    // reach the admin console. With the seed's published password that is
+    // RELOAD/KILL/SHUTDOWN over the edge all tenants share.
+    //
+    // `pgbstats` needs its own line: `auth_type = hba` means the hba governs
+    // console connections too, and `stats_users` in the ini is authorisation
+    // AFTER authentication, not instead of it. A rule for pgbadmin alone left
+    // the metrics exporter unable to authenticate the moment this file
+    // replaced the seed copy.
+    //
+    // Guarded like every other interpolated value below, and for the same
+    // reason: this one arrives from CRYPTARCH_CONSOLE_CIDR, which is trimmed
+    // and non-empty-checked in config.rs and otherwise unvalidated. A newline
+    // in it would inject arbitrary hba lines — and the checksum header is
+    // computed AFTER the body, so drift detection would then certify the
+    // injected file as clean. Falling back to loopback fails closed: the
+    // console becomes unreachable, which is loud, rather than over-permissive,
+    // which is silent.
+    let console_cidr = if console_cidr.contains(char::is_whitespace) || console_cidr.is_empty() {
+        tracing::error!(
+            "refusing to render console CIDR {console_cidr:?} — contains whitespace; \
+             falling back to {DEFAULT_CONSOLE_CIDR}"
+        );
+        DEFAULT_CONSOLE_CIDR
+    } else {
+        console_cidr
+    };
+    for user in ["pgbadmin", "pgbstats"] {
+        body.push_str(&format!("host pgbouncer {user} {console_cidr} scram-sha-256\n"));
+    }
     for r in sorted {
         // Values are schema-validated (CIDR column, name allowlist), but the
         // renderer is the last line of defense — and it must hold in release
@@ -95,11 +131,16 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Load the active rules for a server: entries whose database is active.
 pub async fn load_rules(db: &sqlx::PgPool, server_id: Uuid) -> anyhow::Result<Vec<AclRule>> {
-    Ok(sqlx::query_as::<_, AclRule>(
+    Ok(sqlx::query_as::<_, AclRule>(AssertSqlSafe(format!(
+        // An ACTING question, so the predicate is an inclusion (CRYPTARCH-111):
+        // routing connections to a database being rebuilt is worse than
+        // refusing them, and for a restore withdrawing at the edge first is
+        // what stops the bouncer refilling its pool and racing the drop.
         "SELECT d.name AS db_name, a.cidr::text AS cidr \
          FROM acl_entries a JOIN databases d ON d.id = a.database_id \
-         WHERE d.server_id = $1 AND d.status = 'active'",
-    )
+         WHERE d.server_id = $1 AND {}",
+        crate::status::DbStatus::in_edge_config_sql()
+    )))
     .bind(server_id)
     .fetch_all(db)
     .await?)
@@ -117,6 +158,30 @@ pub enum SyncOutcome {
 /// mutations can't interleave into a stale final file (single process, so a
 /// process-wide lock suffices; the critical section is milliseconds).
 static EDGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Who may reach the bouncer's admin console, as a CIDR (CRYPTARCH-104).
+///
+/// Process-wide rather than threaded through `sync_edge`/`check_drift`, which
+/// are reached from half a dozen handlers and a background loop and have no
+/// business each carrying a copy of one deployment-wide fact. Same reasoning as
+/// `EDGE_LOCK` above.
+///
+/// The default is deliberately the tightest thing that still works for a
+/// same-host deploy. Compose overrides it with the backend network's subnet —
+/// which is pinned for exactly this reason, and which the `db` network (where
+/// tenants live) is not part of.
+static CONSOLE_CIDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+const DEFAULT_CONSOLE_CIDR: &str = "127.0.0.1/32";
+
+/// Set the console CIDR once at boot. Later calls are ignored.
+pub fn set_console_cidr(cidr: String) {
+    let _ = CONSOLE_CIDR.set(cidr);
+}
+
+pub fn console_cidr() -> &'static str {
+    CONSOLE_CIDR.get().map_or(DEFAULT_CONSOLE_CIDR, String::as_str)
+}
 
 /// Render the server's ACL state, write it to the bouncer conf dir, RELOAD.
 /// The single choke-point every ACL mutation and lifecycle change funnels
@@ -163,7 +228,7 @@ async fn sync_edge_inner(
         .ok_or_else(|| anyhow::anyhow!("no such server"))?;
 
     let rules = load_rules(db, server_id).await?;
-    let rendered = render_hba(&rules, &tls_mode);
+    let rendered = render_hba(&rules, &tls_mode, console_cidr());
 
     // Knobs ride the same sync: pool settings are edge state exactly like
     // ACLs, and a single RELOAD applies both files.
@@ -176,6 +241,15 @@ async fn sync_edge_inner(
     };
 
     let dir = std::path::Path::new(&dir);
+    // Init's guard, here too (S8c audit): edge files land only in a directory
+    // that already looks like a bouncer's config — never in whatever a
+    // mistyped or hostile conf dir names.
+    anyhow::ensure!(
+        dir.join("pgbouncer.ini").is_file(),
+        "{} has no pgbouncer.ini — refusing to write edge config into a directory that isn't a \
+         bouncer config dir",
+        dir.display()
+    );
     let path = dir.join("pgbouncer_hba.conf");
     edge::atomic_write(&path, &rendered, 0o644)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
@@ -190,9 +264,17 @@ async fn sync_edge_inner(
     Ok(SyncOutcome::Applied(rules.len()))
 }
 
-/// Disconnect live edge sessions for one database (suspend/delete). Console
-/// KILL is best-effort: the hba line is already gone, so new connections are
-/// refused regardless; KILL just evicts the ones already inside.
+/// Disconnect live edge sessions for one database, before the database itself
+/// goes away (delete today; restore-replace next). Console KILL is
+/// best-effort: the hba line is already gone, so new connections are refused
+/// regardless; KILL just evicts the ones already inside.
+///
+/// LOAD-BEARING, not housekeeping — do not fold this into a caller or drop it
+/// as redundant. Withdrawing at the edge *before* `DROP DATABASE` is what stops
+/// PgBouncer immediately refilling its pool and racing the drop; PostgreSQL
+/// refuses to drop a database with a live session, and the bouncer is happy to
+/// supply one forever. (CRYPTARCH-78 removed the suspend caller; this became
+/// more important with that change, not less.)
 pub async fn kill_db_sessions(db: &sqlx::PgPool, crypto: &Crypto, server_id: Uuid, db_name: &str) {
     let dsn_enc: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT bouncer_admin_dsn_enc FROM managed_servers WHERE id = $1")
@@ -220,8 +302,8 @@ mod tests {
 
     #[test]
     fn renders_deterministically_sorted() {
-        let a = render_hba(&[rule("beta", "10.0.0.0/24"), rule("alpha", "10.1.0.0/16")], "off");
-        let b = render_hba(&[rule("alpha", "10.1.0.0/16"), rule("beta", "10.0.0.0/24")], "off");
+        let a = render_hba(&[rule("beta", "10.0.0.0/24"), rule("alpha", "10.1.0.0/16")], "off", "10.9.0.0/16");
+        let b = render_hba(&[rule("alpha", "10.1.0.0/16"), rule("beta", "10.0.0.0/24")], "off", "10.9.0.0/16");
         assert_eq!(a, b);
         let alpha_pos = a.find("alpha").unwrap();
         let beta_pos = a.find("beta").unwrap();
@@ -229,18 +311,23 @@ mod tests {
     }
 
     #[test]
-    fn console_line_always_present_and_first_rule() {
-        let out = render_hba(&[], "off");
-        assert!(out.contains("host pgbouncer pgbadmin 0.0.0.0/0 scram-sha-256"));
-        // empty ACL = deny everything except console
-        assert_eq!(out.lines().filter(|l| !l.starts_with('#')).count(), 1);
+    fn console_lines_always_present_and_first_rules() {
+        let out = render_hba(&[], "off", "10.9.0.0/16");
+        // The console must survive an empty ACL — otherwise the first sync of
+        // a server with no databases would lock Cryptarch out of its own edge.
+        assert!(out.contains("host pgbouncer pgbadmin 10.9.0.0/16 scram-sha-256"));
+        assert!(out.contains("host pgbouncer pgbstats 10.9.0.0/16 scram-sha-256"));
+        // empty ACL = deny everything except the console (CRYPTARCH-104: two
+        // console users, so two lines — pgbstats authenticates through the hba
+        // exactly like pgbadmin does).
+        assert_eq!(out.lines().filter(|l| !l.starts_with('#')).count(), 2);
     }
 
     #[test]
     fn tls_mode_switches_conn_type() {
-        let off = render_hba(&[rule("app", "10.0.0.0/24")], "off");
+        let off = render_hba(&[rule("app", "10.0.0.0/24")], "off", "10.9.0.0/16");
         assert!(off.contains("\nhost app app 10.0.0.0/24 scram-sha-256"));
-        let edge = render_hba(&[rule("app", "10.0.0.0/24")], "edge");
+        let edge = render_hba(&[rule("app", "10.0.0.0/24")], "edge", "10.9.0.0/16");
         assert!(edge.contains("\nhostssl app app 10.0.0.0/24 scram-sha-256"));
         // console line stays plain host either way (compose-internal hop)
         assert!(edge.contains("host pgbouncer pgbadmin"));
@@ -248,7 +335,7 @@ mod tests {
 
     #[test]
     fn checksum_roundtrip_and_tamper_detection() {
-        let out = render_hba(&[rule("app", "10.0.0.0/24")], "off");
+        let out = render_hba(&[rule("app", "10.0.0.0/24")], "off", "10.9.0.0/16");
         let claimed = claimed_checksum(&out).expect("header present");
         assert_eq!(claimed, body_checksum(&out), "fresh render must verify");
 
@@ -261,7 +348,47 @@ mod tests {
         let out = render_hba(
             &[rule("app", "10.0.0.0/24"), rule("app", "10.10.12.33/32")],
             "off",
+            "10.9.0.0/16",
         );
         assert_eq!(out.matches("host app app").count(), 2);
+    }
+
+    /// CRYPTARCH-104: the console is not open to the world, and both console
+    /// users get a rule.
+    ///
+    /// The negative assertion needs the positive one beside it: "no 0.0.0.0/0"
+    /// is satisfied by a render that emits no console line at all, which would
+    /// lock Cryptarch out of its own edge rather than secure it.
+    #[test]
+    fn the_console_is_scoped_and_covers_both_console_users() {
+        let out = render_hba(&[rule("app", "10.0.0.0/24")], "off", "10.9.0.0/16");
+
+        assert!(out.contains("host pgbouncer pgbadmin 10.9.0.0/16 scram-sha-256"),
+                "the admin console must still be reachable from where Cryptarch runs:\n{out}");
+        assert!(out.contains("host pgbouncer pgbstats 10.9.0.0/16 scram-sha-256"),
+                "the exporter authenticates through the hba too — stats_users is \
+                 authorisation after auth, not instead of it:\n{out}");
+        assert!(!out.contains("0.0.0.0/0"),
+                "the console was reachable from anywhere, including the tenant network:\n{out}");
+    }
+
+    /// The console rule must not fall back to something permissive when nobody
+    /// configured it — an unset value is a same-host deployment, not "any".
+    ///
+    /// Asserts on the CONSTANT, not on `console_cidr()`. The accessor reads a
+    /// process-wide `OnceLock`, so a test that called `set_console_cidr` first
+    /// would change this test's answer depending on the order the harness
+    /// happened to run them in — green today, mysteriously red the day someone
+    /// adds an unrelated test.
+    #[test]
+    fn the_default_console_cidr_is_not_permissive() {
+        assert_eq!(DEFAULT_CONSOLE_CIDR, "127.0.0.1/32");
+        assert!(!DEFAULT_CONSOLE_CIDR.starts_with("0.0.0.0"));
+        // And the accessor really does fall back to it when unset, which is the
+        // half the constant alone cannot show.
+        assert_eq!(
+            CONSOLE_CIDR.get().map_or(DEFAULT_CONSOLE_CIDR, String::as_str),
+            console_cidr()
+        );
     }
 }

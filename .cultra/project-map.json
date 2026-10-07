@@ -1,0 +1,53 @@
+{
+  "entries": [
+    {
+      "dir": "src",
+      "is_own_repo": false,
+      "kind": "misc",
+      "reason": "no manifest",
+      "submodule": false
+    },
+    {
+      "dir": "migrations",
+      "is_own_repo": false,
+      "kind": "misc",
+      "reason": "no manifest",
+      "submodule": false
+    },
+    {
+      "dir": "assets",
+      "is_own_repo": false,
+      "kind": "misc",
+      "reason": "no manifest",
+      "submodule": false
+    },
+    {
+      "dir": "bouncer-seed",
+      "is_own_repo": false,
+      "kind": "misc",
+      "reason": "no manifest",
+      "submodule": false
+    },
+    {
+      "dir": "tests",
+      "is_own_repo": false,
+      "kind": "misc",
+      "reason": "no manifest",
+      "submodule": false
+    }
+  ],
+  "generated_at": "2026-07-19T00:17:07.060210348Z",
+  "ignored": [
+    {
+      "dir": "target",
+      "reason": "default"
+    },
+    {
+      "dir": "dev-bouncer",
+      "reason": "gitignore"
+    }
+  ],
+  "root": "/home/antun/Project/cryptarch",
+  "root_is_git_repo": true,
+  "structure": "single_project"
+}

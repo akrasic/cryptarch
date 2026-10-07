@@ -201,6 +201,12 @@ Full env reference: `CRYPTARCH_METADATA_DSN`*, `CRYPTARCH_ADMIN_PASSWORD`*,
 `CRYPTARCH_ADMIN` (admin), `CRYPTARCH_DEFAULT_QUOTA` (3);
 `CRYPTARCH_HEALTH_INTERVAL_SECS` (60, 0 = off), `CRYPTARCH_NOTIFY_URL`
 (unset = audit-only), `CRYPTARCH_NOTIFY_FORMAT` (ntfy | json);
+`CRYPTARCH_BACKUP_DIR` (unset = backups off; needs `postgresql-client-18` on
+PATH for `pg_dump`, and the unit's user must own the directory),
+`CRYPTARCH_BACKUP_INTERVAL_SECS` (86400, 0 = manual only), `CRYPTARCH_BACKUP_KEEP`
+(7 successes per database, 0 = keep all), `CRYPTARCH_BACKUP_STALE_AFTER_SECS`
+(172800, 0 = off) — or drive it externally with `cryptarch backup --all` from a
+systemd timer, which exits non-zero if any backup failed;
 `CRYPTARCH_INSECURE_COOKIES` (dev only), `CRYPTARCH_ALLOW_SUPERUSER_ADMIN`
 (dev only, never production); seed block optional as above.
 

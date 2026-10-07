@@ -1,0 +1,424 @@
+/* Cryptarch — the Keyring design system (CRYPTARCH-151).
+   The reference is the Design System artifact
+   (https://claude.ai/artifact/Kw4ysuVpG8YCRdRYHwbVfR): these tokens are its
+   tokens.json, value for value, and the shell below is its Sidebar and
+   PageHeader. Change a value there first, then here. Every text pair named in
+   a token's usage note holds 4.5:1 in both themes; re-check if you touch one.
+
+   Theme: light by default, dark when the system asks for it. [data-theme]
+   on <html> overrides either way, for a switch later. */
+
+@font-face {
+  font-family: "Figtree";
+  src: url("/static/fonts/figtree-var.woff2") format("woff2");
+  font-weight: 300 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "DM Mono";
+  src: url("/static/fonts/dm-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "DM Mono";
+  src: url("/static/fonts/dm-mono-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --bg: #f2f1ee;
+  --sidebar: #ebe9e4;
+  --surface: #ffffff;
+  --surface-sunken: #e9e7e2;
+  --surface-hover: #f7f6f3;
+  --line: #e3e0da;
+  --line-strong: #d2cec6;
+  --control-border: #8b867d;
+  --ink: #23221f;
+  --ink-dim: #5f5b54;
+  --accent: #2d6a4f;
+  --accent-hover: #245a42;
+  --on-accent: #ffffff;
+  --accent-wash: #e2efe7;
+  --link: #2d6a4f;
+  --focus: var(--accent);
+  --ok: #2d6a4f;
+  --progress: #2f5885;
+  --progress-wash: #e3ebf4;
+  --warn: #83560f;
+  --warn-wash: #f6ecd9;
+  --danger: #ad3528;
+  --danger-hover: #962c21;
+  --on-danger: #ffffff;
+  --danger-wash: #f9e7e4;
+  --scrim: rgba(35, 34, 31, 0.4);
+  --shadow-subtle: 0 1px 2px rgba(35, 34, 31, 0.08);
+  --shadow-card: 0 1px 2px rgba(35, 34, 31, 0.07), 0 6px 18px rgba(35, 34, 31, 0.07);
+  --shadow-overlay: 0 12px 40px rgba(35, 34, 31, 0.2);
+  color-scheme: light;
+
+  --font-sans: Figtree, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "DM Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-pill: 999px;
+  --sidebar-width: 236px;
+  --content-max: 1040px;
+  --control-height: 34px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1a1a18;
+    --sidebar: #151513;
+    --surface: #232320;
+    --surface-sunken: #2c2c28;
+    --surface-hover: #2a2a26;
+    --line: #33332e;
+    --line-strong: #45453f;
+    --control-border: #7b7972;
+    --ink: #ecebe7;
+    --ink-dim: #a8a69f;
+    --accent: #6cc39a;
+    --accent-hover: #82d0ab;
+    --on-accent: #10221a;
+    --accent-wash: #1e3328;
+    --link: #7fd0aa;
+    --ok: #6cc39a;
+    --progress: #8fb3e0;
+    --progress-wash: #1d2a3a;
+    --warn: #e2b05a;
+    --warn-wash: #352a17;
+    --danger: #ee8073;
+    --danger-hover: #f39488;
+    --on-danger: #2a0f0b;
+    --danger-wash: #3a1f1b;
+    --scrim: rgba(0, 0, 0, 0.6);
+    --shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 6px 18px rgba(0, 0, 0, 0.35);
+    --shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.6);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1a1a18;
+  --sidebar: #151513;
+  --surface: #232320;
+  --surface-sunken: #2c2c28;
+  --surface-hover: #2a2a26;
+  --line: #33332e;
+  --line-strong: #45453f;
+  --control-border: #7b7972;
+  --ink: #ecebe7;
+  --ink-dim: #a8a69f;
+  --accent: #6cc39a;
+  --accent-hover: #82d0ab;
+  --on-accent: #10221a;
+  --accent-wash: #1e3328;
+  --link: #7fd0aa;
+  --ok: #6cc39a;
+  --progress: #8fb3e0;
+  --progress-wash: #1d2a3a;
+  --warn: #e2b05a;
+  --warn-wash: #352a17;
+  --danger: #ee8073;
+  --danger-hover: #f39488;
+  --on-danger: #2a0f0b;
+  --danger-wash: #3a1f1b;
+  --scrim: rgba(0, 0, 0, 0.6);
+  --shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 6px 18px rgba(0, 0, 0, 0.35);
+  --shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
+}
+
+/* ---- base elements ------------------------------------------------------- */
+
+* { box-sizing: border-box; }
+/* 14px is the design system's body size; rem-based values follow it. */
+html { font-size: 14px; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  font: 400 14px/1.5 var(--font-sans);
+  color: var(--ink);
+  background: var(--bg);
+}
+::selection { background: var(--accent-wash); color: var(--ink); }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+h1 { margin: 0 0 var(--space-4); font-size: 26px; line-height: 32px; font-weight: 700; letter-spacing: -0.02em; }
+h2 { margin: var(--space-8) 0 var(--space-3); font-size: 18px; line-height: 26px; font-weight: 700; letter-spacing: -0.01em; color: var(--ink); }
+code, pre { font-family: var(--font-mono); }
+code { font-size: 0.88em; background: var(--surface-sunken); padding: 0.12em 0.38em; border-radius: 5px; }
+pre code, a code { background: none; padding: 0; }
+a { color: var(--link); text-decoration: none; transition: color 140ms ease; }
+a:hover { color: var(--link); text-decoration: underline; text-underline-offset: 3px; }
+/* Every control's focus mark: 2px of the focus token, 3:1 or better on every
+   surface in both themes. */
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.input:focus { border-color: var(--focus); }
+
+/* ---- the mark and the wordmark ------------------------------------------ */
+
+.mark {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  background: var(--accent);
+  border-radius: 50% 50% 50% 2px;
+}
+a.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  text-decoration: none;
+}
+a.brand:hover { color: var(--ink); text-decoration: none; }
+
+/* ---- the shell: sidebar + content column --------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  min-height: 100vh;
+}
+.shell-side {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  background: var(--sidebar);
+  border-right: 1px solid var(--line);
+}
+.shell-body { min-width: 0; display: flex; flex-direction: column; }
+/* overflow-x clip: a long unbroken token (a DSN in an engine error) must never
+   give the whole page a horizontal scrollbar. */
+.shell-main {
+  min-width: 0;
+  padding: var(--space-6) var(--space-8) var(--space-12);
+  overflow-x: clip;
+}
+.shell-main > .inner { max-width: var(--content-max); }
+.phonebar { display: none; }
+.switcher { display: none; }
+
+/* ---- the sidebar ------------------------------------------------------- */
+
+nav.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-height: 100%;
+  padding: var(--space-4) var(--space-3);
+  font-family: var(--font-sans);
+}
+nav.sidebar a.brand { padding: 2px var(--space-2); }
+a.side-back {
+  font-size: 13px;
+  line-height: 19px;
+  color: var(--ink-dim);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+}
+a.side-back:hover { color: var(--ink); text-decoration: none; }
+.side-scope {
+  background: var(--surface);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-subtle);
+  padding: 10px var(--space-3);
+  display: grid;
+  gap: 2px;
+}
+.side-scope-name {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 15px;
+  line-height: 22px;
+  color: var(--ink);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+  overflow-wrap: anywhere;
+}
+.side-scope-name .st { font-family: var(--font-sans); flex: none; }
+.side-scope-meta { font-size: 12px; line-height: 16px; color: var(--ink-dim); }
+.side-group { display: grid; gap: 1px; }
+.side-label {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink-dim);
+  padding: 6px var(--space-2) var(--space-1);
+}
+a.side-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--ink-dim);
+  font-size: 13.5px;
+  line-height: 20px;
+  text-decoration: none;
+}
+a.side-item:hover { color: var(--ink); background: var(--surface-hover); text-decoration: none; }
+a.side-item[aria-current] {
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 600;
+  box-shadow: var(--shadow-subtle);
+}
+.side-foot {
+  margin-top: auto;
+  border-top: 1px solid var(--line);
+  padding: 10px var(--space-2) 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 13px;
+}
+.side-foot a.side-account {
+  display: grid;
+  color: var(--ink-dim);
+  text-decoration: none;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.side-foot a.side-account:hover,
+.side-foot a.side-account[aria-current="page"] { color: var(--ink); }
+.side-foot a.side-account[aria-current="page"] { font-weight: 600; }
+.side-role { font-size: 12px; line-height: 16px; color: var(--ink-dim); font-weight: 400; }
+.side-foot button.side-signout {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-dim);
+  background: none;
+  border: 0;
+  padding: var(--space-1);
+  margin: calc(-1 * var(--space-1));
+  cursor: pointer;
+}
+.side-foot button.side-signout:hover { color: var(--ink); background: none; text-decoration: underline; }
+.side-error { margin: 0; padding: 0 var(--space-2); font-size: 12px; line-height: 16px; color: var(--danger); }
+
+/* ---- phone: a top bar, a drawer, and a section switcher ------------------ */
+
+.drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  background: var(--scrim);
+}
+.drawer {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 301;
+  width: min(var(--sidebar-width), 86vw);
+  overflow-y: auto;
+  background: var(--sidebar);
+  box-shadow: var(--shadow-overlay);
+}
+
+@media (max-width: 760px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .shell-side { display: none; }
+  .shell-main { padding: var(--space-4) var(--space-4) var(--space-8); }
+  .phonebar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: 10px var(--space-4);
+    background: var(--sidebar);
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .phonebar .who { margin-left: auto; font-size: 13px; color: var(--ink-dim); overflow-wrap: anywhere; }
+  button.menu-btn {
+    width: var(--control-height);
+    height: var(--control-height);
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--ink);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+  }
+  button.menu-btn:hover { background: var(--surface-hover); }
+  button.menu-btn span,
+  button.menu-btn span::before,
+  button.menu-btn span::after {
+    display: block;
+    width: 16px;
+    height: 2px;
+    background: currentColor;
+    border-radius: 1px;
+    position: relative;
+  }
+  button.menu-btn span::before,
+  button.menu-btn span::after { content: ""; position: absolute; left: 0; }
+  button.menu-btn span::before { top: -5px; }
+  button.menu-btn span::after { top: 5px; }
+
+  button.switcher {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0 0 var(--space-4);
+    padding: 9px var(--space-3);
+    background: var(--surface);
+    border: 0;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-subtle);
+    font: inherit;
+    font-size: 13.5px;
+    color: var(--ink-dim);
+    cursor: pointer;
+    text-align: left;
+  }
+  button.switcher:hover { background: var(--surface); }
+  button.switcher .sw-name { font-family: var(--font-mono); min-width: 0; overflow-wrap: anywhere; display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+  button.switcher .sw-name .st { font-family: var(--font-sans); }
+  button.switcher b { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  button.switcher b::after {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-left: 8px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: translateY(-3px) rotate(45deg);
+  }
+}
